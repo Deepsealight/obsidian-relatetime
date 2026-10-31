@@ -1,5 +1,7 @@
 # RelateTime - 人物关系时间轴推算图谱 
 
+[English](README.md) · **简体中文**
+
 **RelateTime** 是一款专为创作者、网文写手和世界观构建者设计的 Obsidian 核心插件。它基于 React 和高性能的 D3.js 物理引擎，将沉闷的 Markdown 文本属性转化为**随时间流转的动态人物关系网**。
 
 本插件是通过Agent创造的。
