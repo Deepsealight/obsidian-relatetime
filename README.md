@@ -1,5 +1,7 @@
 # RelateTime - Dynamic Character Relationship Timeline Graph
 
+**English** · [简体中文](README.zh-CN.md)
+
 **RelateTime** is an Obsidian core plugin designed specifically for creators, web novelists, and world-builders. Built on React and a high-performance D3.js physics engine, it transforms dull Markdown text attributes into a **dynamic character relationship network that flows with time**.
 
 This plugin was created by an Agent.
