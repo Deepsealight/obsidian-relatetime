@@ -7,6 +7,8 @@ This plugin was created by an Agent.
 Through an original "Hybrid Deterministic Engine + LLM Global Knowledge Graph Completion" system, RelateTime can automatically infer complex kinship, academic (mentor/disciple), and in-law relationships you haven't explicitly written, while warning you of logical or gender contradictions.
 
 ---
+<img width="2448" height="1520" alt="image" src="https://github.com/user-attachments/assets/760fc1ac-8a86-400c-a1c9-4d41a5fd3e92" />
+
 
 ## ✨ Core Features
 
