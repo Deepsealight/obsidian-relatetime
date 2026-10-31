@@ -1,0 +1,10 @@
+{
+  "id": "relatetime",
+  "name": "RelateTime",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "基于 React 和 D3 的人物关系时间轴与推算图谱。",
+  "author": "liushisan",
+  "authorUrl": "",
+  "isDesktopOnly": false
+}
