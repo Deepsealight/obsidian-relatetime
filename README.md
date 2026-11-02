@@ -1,88 +1,89 @@
-# RelateTime - Dynamic Character Relationship Timeline Graph
+# RelateTime - Character Relationship Timeline Inference Graph
 
 **English** · [简体中文](README.zh-CN.md)
 
-**RelateTime** is an Obsidian core plugin designed specifically for creators, web novelists, and world-builders. Built on React and a high-performance D3.js physics engine, it transforms dull Markdown text attributes into a **dynamic character relationship network that flows with time**.
+**RelateTime** is an Obsidian plugin designed for creators, web novel writers, and worldbuilders. Built with React and a high-performance D3.js physics engine, it turns dry Markdown text properties into a **dynamic character relationship graph that evolves over time**.
 
 This plugin was created by an Agent.
 
-Through an original "Hybrid Deterministic Engine + LLM Global Knowledge Graph Completion" system, RelateTime can automatically infer complex kinship, academic (mentor/disciple), and in-law relationships you haven't explicitly written, while warning you of logical or gender contradictions.
+With its original “hybrid deterministic engine + LLM-based global knowledge graph completion,” RelateTime can automatically complete complex kinship, fellow-disciple, and in-law relationships that you have not written out, and warn you when logical or gender contradictions occur.
 
 ---
 
 <img src="https://github.com/user-attachments/assets/e38b42ab-1cfe-4171-8066-6d85891878ee" style="width: 100%; height: auto;" alt="RelateTime Demo" />
+
 <img src="https://github.com/user-attachments/assets/cebb7756-39bc-4249-9c26-a6e88c189a85" style="width: 100%; height: auto;" alt="RelateTime Demo" />
 
 
-## ✨ Core Features
+## ✨ Features
 
-
-### 🕰️ Ultra-Precision Timeline
-- **BC/BCE Support**: Supports an infinite time span from 3000 BC to the far future, whether it's prehistoric times, cultivation eras, or interstellar futures.
-- **Dynamic Infinite Zoom**: Seamlessly zoom from a "Decade View (100 years)" down to an "Hour View (down to a specific date and hour)".
-- **Synchronized State Flow**: Drag the timeline, and the graph will display the exact character relationships active at that specific point in time in real-time.
+### 🕰️ Full-Scale Ultra-Precision Timeline
+- **BC/BCE support**: Whether it is prehistoric times, a cultivation era, or an interstellar future, it supports an unlimited span from 3000 BC to the future.
+- **Seamless dynamic zoom**: Smoothly zoom from “century view (100 years)” all the way down to “hour view (down to a specific date and hour).”
+- **Synchronized state transitions**: Drag the timeline and the graph displays the character relationships that are exactly active at that point in time.
 
 ### 🧠 Hybrid Inference Engine
-- **100% Stable Local Rule Engine**: Automatically implements deterministic logic such as siblings, shared parents, and shared mentors with zero latency and absolute consistency.
-- **LLM Global Graph Completion**: Connects to OpenAI-compatible LLM APIs (like gpt-4o or local LM Studio). The model analyzes the entire network to infer cross-generational (grandparents/grand-disciples), collateral (uncles/aunts), and in-law (sister-in-law/parents-in-law) relationships.
-- **Two Inference Modes**: Choose between "Show Partial Inference (core direct lines and closed loops only)" and "Show Full Inference (including collateral and cross-generational)" to prevent link explosion.
+- **100% stable local rule engine**: Automatically infers mutual sibling relationships, shared-parent relationships, shared masters among fellow disciples, and other deterministic logic with zero latency and absolutely consistent results.
+- **LLM Integration for global graph completion**: Connect to an OpenAI-compatible LLM API (such as gpt-4o or a local LM Studio instance). The model analyzes the entire character network and automatically infers cross-generational (grandparent–grandchild / master's master), collateral (uncles/aunts), and in-law (elder brother's wife / parents-in-law / wife's elder brother) relationships.
+- **Two inference modes**: Choose “Show partial inferences (core direct-line and closed-loop relationships only)” or “Show all inferences (including collateral and cross-generational relationships)” to avoid an explosion of edges.
 
-### 🛡️ Smart Ethical Conflict Detection
-- Automatically verifies if the "Gender" attribute in the note matches the provided "Relationship Title".
-- When logical contradictions occur (e.g., set as male but filled in as a wife; or generational seniority crossing), the graph highlights **red warning links**. Hover over them to see a detailed conflict analysis Tooltip.
+### 🛡️ Intelligent Conflict Detection
+- Automatically verifies whether the “gender” property in a note matches the recorded relationship label.
+- When a logical contradiction occurs (for example, gender is set to male but the character is recorded in the wife role; or generation/seniority relationships conflict and overlap), the graph highlights the edge with a **red warning line**. Hover over it to view a detailed conflict analysis tooltip.
 
 ### 🎨 Optimized D3 Geometric Rendering
-- **Flow Slot Anti-Overlap Layout**: Multiple relationship links (e.g., two people are both spouses and mentor/disciple) are automatically spread out in parallel with fixed spacing. Text staggers along the link direction, completely eliminating text overlap.
-- **Smart Unidirectional Merging**: Identical reciprocal relationships (e.g., "Friend ⇄ Friend", "Peer ⇄ Peer") are intelligently folded into a single solid line with bidirectional arrows, keeping the graph clean.
-- **Deep Customizable Appearance**: Fully restores and enhances Obsidian's native graph physics settings (centripetal force, repulsion, link distance, etc.) and supports pixel-level adjustments for node size, line width, and opacity at various levels.
+- **Flow-slot anti-overlap layout**: Multiple relationship edges (such as two people being both spouses and master-disciple) are automatically laid out in parallel at fixed intervals, and labels are staggered along the edge direction to completely eliminate text overlap.
+- **Smart single-line bidirectional merging**: Reciprocal identical relationships (such as “friend ⇄ friend” and “fellow disciple ⇄ fellow disciple”) are intelligently collapsed into a single solid line with bidirectional arrows, keeping the graph clean and clear.
+- **Deeply customizable appearance**: Fully restores and enhances Obsidian's native graph physics settings (centering force, repulsion force, link distance, etc.), and supports pixel-level adjustments for node size, line width, and opacity at each hierarchy level.
 
 ---
 
 ## 📦 Installation
 
-*(Note: Once approved in the Obsidian Community Plugins directory, you can search for RelateTime and install it directly within the app.)*
+**RelateTime is now available in the Obsidian Community Plugin marketplace. You can search for RelateTime and install it directly in the app.**
 
-**Manual Installation:**
-1. Go to the [Releases page](https://github.com/Deepsealight/obsidian-relatetime/releases) of the GitHub repository.
-2. Download the `main.js`, `manifest.json`, and `styles.css` files from the latest release.
-3. Create a folder named `relatetime` inside your Obsidian vault's `.obsidian/plugins/` directory, and place the downloaded files inside.
-4. Restart Obsidian, and enable **RelateTime** in `Settings -> Community Plugins`.
+**Manual installation:**
+1. Go to the GitHub repository's [Releases page](https://github.com/your-username/obsidian-relatetime/releases).
+2. Download the latest `RelateTime.zip`.
+3. Extract it and place the `relatetime` folder into the `.obsidian/plugins/` folder in your Obsidian vault.
+4. Restart Obsidian and enable **RelateTime** under `Settings -> Third-party plugins`.
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Usage
 
-### 1. Complete the Character Card (Frontmatter)
-In your Obsidian notes, ensure you include the following YAML Frontmatter attributes:
+### 1. Complete character cards (Frontmatter)
+In your Obsidian notes, make sure to include the following YAML Frontmatter properties:
 
 ```yaml
 ---
-type: Character
-character-name: Venti
-性别: 男 (Male)
+type: 人物
+character-name: 温迪
+性别: 男
 关系: 张三 - 师父（2020-08-13 BC 1:00 ～ 2024-08-26 BC 17:00），李四-夫妻（2025-08-13 BC 13:00:00 ～ 2025-08-26 BC 13:00:00）、赵五 -大哥（固定）
 ---
 ```
 
-*(Note: The attribute name and value for `type` can be customized in the plugin settings.)*
+*(Note: Both the property name and property value of `type` can be customized in the plugin settings. The example above uses the default Chinese property names.)*
 
 **Relationships:**
 
-Dates can be AD (without BC), and times can be omitted. For relationships that do not change over time, use **(固定)** (Fixed) to denote them.
+Dates may be CE/AD (without BC), may omit hours and minutes, and relationships that do not change over time can be marked with **`(固定)`** (fixed).
 
-For example, the attribute `张三 - 师父（2020-08-13 BC 1:00 ～ 2024-08-26 BC 17:00）` indicates that from 2020-08-13 BC 1:00 to 2024-08-26 BC 17:00, **张三** (Zhang San) is the **"师父"** (Mentor) of **this file**.
+For example, `张三 - 师父（2020-08-13 BC 1:00 ～ 2024-08-26 BC 17:00）` means that from 2020-08-13 BC 1:00 to 2024-08-26 BC 17:00, **张三** is the **“master”** of **this file**.
 
-### 2. Configure LLM (Optional, for global deep inference)
+### 2. Configure the LLM (for global deep inference)
 
-1. Open the RelateTime plugin settings page.
-2. Locate the **LLM Relationship Inference Settings**.
-3. Enter your API URL (local model addresses are supported) and API Key.
-4. Enter the model name (e.g., `gpt-4o-mini`) and click "hi测试" (Test Connection) to verify connectivity.
-5. Click **"AI 重新推演关系"** (AI Re-infer Relationships) in the top-left corner of the graph to generate global high-level relationships with one click.
+- Open the RelateTime plugin settings page.
+- Find **LLM Relationship Inference Settings**.
+- Enter your API URL (local model addresses are supported) and API Key.
+- Enter the model name (such as `gpt-4o-mini`), then click **Hi Test** (`hi测试`) to verify connectivity.
+- Click **AI Re-infer Relationships** (`AI 重新推演关系`) in the upper-left corner of the graph to generate high-level global relationships in one click.
 
-### 3. Graph Operations
+### 3. Operate the graph and list
 
-- Click the **"Relationship Network"** icon in the left sidebar to open the view.
-- **Drag the bottom timeline ruler** to pan through time.
-- **Scroll the mouse wheel** to zoom in/out on timeline precision.
-- **Click a node** to lock focus. The **right-side menu** provides powerful search (displaying neighbors as well) and appearance customization features.
+- Click the **Relationship Network** icon in the left sidebar to open the view.
+- **Drag the bottom ruler** to pan through time.
+- **Scroll the mouse wheel** to zoom in/out on the timeline precision.
+- **Click a node** to lock focus. The **right-side menu** provides powerful search (showing neighbors) and appearance customization.
+- **List view**: In the list page, a relationship entry indicates that the character at the top is the [relationship] of the character on the left.
