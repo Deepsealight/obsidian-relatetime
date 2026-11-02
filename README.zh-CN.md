@@ -9,7 +9,10 @@
 通过独创的“混合确定性引擎 + 大模型全局知识图谱补全”，RelateTime 能够自动补全你未写出的复杂亲属、同门与姻亲关系，并在出现逻辑或性别矛盾时向你发出警告。
 
 ---
-<img width="2448" height="1520" alt="image" src="https://github.com/user-attachments/assets/99723556-1e64-40a5-a2cc-405663ca9fd1" />
+
+<img src="https://github.com/user-attachments/assets/e38b42ab-1cfe-4171-8066-6d85891878ee" style="width: 100%; height: auto;" alt="RelateTime Demo" />
+
+<img src="https://github.com/user-attachments/assets/cebb7756-39bc-4249-9c26-a6e88c189a85" style="width: 100%; height: auto;" alt="RelateTime Demo" />
 
 
 ## ✨ 核心特色 (Features)
