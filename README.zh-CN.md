@@ -45,7 +45,7 @@
 **手动安装：**
 1. 前往 GitHub 仓库的 [Releases 页面](https://github.com/你的用户名/obsidian-relatetime/releases)。
 2. 下载最新版本的 `RelateTime.zip`。
-3. 解压文件夹，并将文件夹`relatetime`放入你的 Obsidian 仓库目录下的 `.obsidian/plugins/` 文件夹中。
+3. 解压后将文件夹 `relatetime` 放入你的 Obsidian 仓库目录下的 `.obsidian/plugins/` 文件夹中。
 4. 重启 Obsidian，在 `设置 -> 第三方插件` 中启用 **RelateTime**。
 
 ---
