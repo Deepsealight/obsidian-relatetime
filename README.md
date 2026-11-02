@@ -43,7 +43,7 @@ With its original “hybrid deterministic engine + LLM-based global knowledge gr
 **RelateTime is now available in the Obsidian Community Plugin marketplace. You can search for RelateTime and install it directly in the app.**
 
 **Manual installation:**
-1. Go to the GitHub repository's [Releases page](https://github.com/your-username/obsidian-relatetime/releases).
+1. Go to the GitHub repository's [Releases page]([https://github.com/your-username/obsidian-relatetime/releases](https://github.com/Deepsealight/obsidian-relatetime/releases)).
 2. Download the latest `RelateTime.zip`.
 3. Extract it and place the `relatetime` folder into the `.obsidian/plugins/` folder in your Obsidian vault.
 4. Restart Obsidian and enable **RelateTime** under `Settings -> Third-party plugins`.
