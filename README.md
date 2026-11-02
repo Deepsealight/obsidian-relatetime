@@ -10,9 +10,12 @@ Through an original "Hybrid Deterministic Engine + LLM Global Knowledge Graph Co
 
 ---
 
-<img src="https://github.com/user-attachments/assets/760fc1ac-8a86-400c-a1c9-4d41a5fd3e92" style="width: 100%; height: auto;" alt="RelateTime Demo" />
+<img src="https://github.com/user-attachments/assets/e38b42ab-1cfe-4171-8066-6d85891878ee" style="width: 100%; height: auto;" alt="RelateTime Demo" />
+<img src="https://github.com/user-attachments/assets/cebb7756-39bc-4249-9c26-a6e88c189a85" style="width: 100%; height: auto;" alt="RelateTime Demo" />
+
 
 ## ✨ Core Features
+
 
 ### 🕰️ Ultra-Precision Timeline
 - **BC/BCE Support**: Supports an infinite time span from 3000 BC to the far future, whether it's prehistoric times, cultivation eras, or interstellar futures.
