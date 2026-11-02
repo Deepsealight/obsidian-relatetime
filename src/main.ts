@@ -68,6 +68,7 @@ export interface RelateTimeSettings {
   llmApiKey: string;
   llmModel: string;
   llmPrompt: string;
+  autoLlmInfer: boolean;
   llmCache: {
     fingerprint: string;
     semanticMap: Record<string, { category: string; reverseLabel: string; conflictReason: string }>;
@@ -85,6 +86,7 @@ export const DEFAULT_SETTINGS: RelateTimeSettings = {
   llmApiKey: '',
   llmModel: '',
   llmPrompt: DEFAULT_LLM_PROMPT,
+  autoLlmInfer: false,
   llmCache: {
     fingerprint: '',
     semanticMap: {},
@@ -346,23 +348,35 @@ class RelateTimeSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
+    // 1. 关系推演提示词（改为上下结构，多行文本框在标题正下方占满宽度）
+    const promptSetting = new Setting(containerEl)
       .setName('关系推演提示词 (System Prompt)')
-      .setDesc('指导大模型结合人物性别进行关系推算与冲突检测的系统提示词')
-      .addTextArea((area) => {
-        area
-          .setPlaceholder('请输入系统提示词...')
-          .setValue(this.plugin.settings.llmPrompt)
-          .onChange(async (value) => {
-            this.plugin.settings.llmPrompt = value;
-            await this.plugin.saveSettings();
-          });
-        area.inputEl.rows = 10;
-        area.inputEl.style.width = '100%';
-        area.inputEl.style.fontFamily = 'monospace';
-        area.inputEl.style.fontSize = '12px';
-      });
+      .setDesc('指导大模型结合人物性别进行关系推算与冲突检测的系统提示词');
 
+    // 让当前 Setting 容器变成纵向排列，使文本框独占下方整行
+    promptSetting.settingEl.style.flexDirection = 'column';
+    promptSetting.settingEl.style.alignItems = 'stretch';
+    promptSetting.settingEl.style.gap = '10px';
+    promptSetting.controlEl.style.width = '100%';
+
+    promptSetting.addTextArea((text) => {
+      text
+        .setPlaceholder('输入系统提示词...')
+        .setValue(this.plugin.settings.llmPrompt)
+        .onChange(async (value) => {
+          this.plugin.settings.llmPrompt = value;
+          await this.plugin.saveSettings();
+        });
+      text.inputEl.rows = 10;
+      text.inputEl.style.width = '100%';
+      text.inputEl.style.fontFamily = 'var(--font-monospace)';
+      text.inputEl.style.fontSize = '12px';
+      text.inputEl.style.lineHeight = '1.5';
+      text.inputEl.style.padding = '8px';
+      text.inputEl.style.boxSizing = 'border-box';
+    });
+
+    // 2. 提示词与缓存管理（保持不变）
     new Setting(containerEl)
       .setName('提示词与缓存管理')
       .setDesc('将提示词恢复为系统默认，或清除已保存的分析缓存')
@@ -379,10 +393,24 @@ class RelateTimeSettingTab extends PluginSettingTab {
           .setButtonText('清空分析缓存')
           .setWarning()
           .onClick(async () => {
-            // 补上 globalInferred: []
             this.plugin.settings.llmCache = { fingerprint: '', semanticMap: {}, globalInferred: [], updatedAt: 0 };
             await this.plugin.saveSettings();
             new Notice('🗑️ 已清空分析缓存');
+          })
+      );
+
+    // 3. 最底部新增：自动触发大模型推演开关
+    new Setting(containerEl)
+      .setName('自动触发大模型推演 (实时同步)')
+      .setDesc(
+        '默认关闭以节省 Token 消耗。关闭时，仅在主界面左上角手动点击「AI 重新推演关系」按钮后才会调用大模型；开启后，每当人物卡片或关系属性发生变动时将自动在后台触发大模型推算。'
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.autoLlmInfer ?? false)
+          .onChange(async (value) => {
+            this.plugin.settings.autoLlmInfer = value;
+            await this.plugin.saveSettings();
           })
       );
   }

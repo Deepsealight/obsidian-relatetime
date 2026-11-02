@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react';
-import { Settings, Search, X, Plus, ChevronDown, ChevronRight, Calendar, ZoomIn, ZoomOut, RefreshCw, Sparkles, AlertTriangle } from 'lucide-react';
+import { Settings, Search, X, Plus, ChevronDown, ChevronRight, Calendar, ZoomIn, ZoomOut, RefreshCw, Sparkles, AlertTriangle, GripVertical, Clock } from 'lucide-react';
 import { Notice, requestUrl } from 'obsidian';
 import * as d3 from 'd3';
 
@@ -8,9 +8,23 @@ interface NodeData extends d3.SimulationNodeDatum {
   id: string;
   label: string;
   realName: string;
+  path: string;
   gender: '男' | '女' | '未知';
+  aliases: string[];
+  ctime: number;
+  mtime: number;
   isIsolated?: boolean;
 }
+
+type ListSortMode =
+  | 'explorer'
+  | 'manual'
+  | 'name-asc'
+  | 'name-desc'
+  | 'mtime-desc'
+  | 'mtime-asc'
+  | 'ctime-desc'
+  | 'ctime-asc';
 
 interface SemanticCacheEntry {
   category: string;
@@ -41,8 +55,8 @@ interface RawRelationEdge {
 
 interface LinkData extends d3.SimulationLinkDatum<NodeData> {
   id: string;
-  source: any; // 改为 any 绕过复杂的 D3 初始化类型检查
-  target: any; // 改为 any 绕过复杂的 D3 初始化类型检查
+  source: any;
+  target: any;
   sourceId: string;
   targetId: string;
   label: string;
@@ -120,7 +134,7 @@ const Accordion = ({ title, defaultOpen = true, children }: { title: string; def
   );
 };
 
-// ---------------- 日期、性别與強制語義歸一化工具函數 ----------------
+// ---------------- 日期、性别与强制语义归一化工具函数 ----------------
 const MONTH_NAMES_ZH = ['1月', '2月', '3月', '4月', '5月', '6月', '7月', '8月', '9月', '10月', '11月', '12月'];
 const WEEK_NAMES_ZH = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
 const MONTH_DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
@@ -138,7 +152,45 @@ const normalizeGender = (raw: any): '男' | '女' | '未知' => {
   return '未知';
 };
 
-// 关键修复：强制归一化语义类别，彻底防止大模型返回非标分类名导致「同门、丈夫、弟弟」重复生成两条线！
+const extractAliases = (fm: any, displayName: string): string[] => {
+  const raw = fm?.['aliases'] ?? fm?.['alias'] ?? fm?.['别名'];
+  if (!raw) return [];
+  const arr = Array.isArray(raw) ? raw : String(raw).split(/[,，、]/);
+  return arr
+    .map((a: any) => String(a || '').trim())
+    .filter((a: string) => a.length > 0 && a !== displayName);
+};
+
+// 深度递归提取任意插件配置对象（如 Flexplorer / Custom Sort）中的文件排序标识序列
+const extractOrderStringsFromObject = (obj: any, bucket: string[] = [], visited = new Set<any>()): string[] => {
+  if (!obj || typeof obj !== 'object' || visited.has(obj)) return bucket;
+  visited.add(obj);
+
+  if (Array.isArray(obj)) {
+    obj.forEach((item) => {
+      if (typeof item === 'string' && item.trim()) {
+        bucket.push(item.trim());
+      } else if (item && typeof item === 'object') {
+        const candidate = item.path || item.name || item.basename || item.id || item.file || item.title;
+        if (typeof candidate === 'string' && candidate.trim()) {
+          bucket.push(candidate.trim());
+        }
+        extractOrderStringsFromObject(item, bucket, visited);
+      }
+    });
+  } else {
+    Object.entries(obj).forEach(([k, val]) => {
+      if (typeof val === 'number' && (k.endsWith('.md') || k.includes('/'))) {
+        bucket.push(k);
+      } else if (val && typeof val === 'object') {
+        extractOrderStringsFromObject(val, bucket, visited);
+      }
+    });
+  }
+  return bucket;
+};
+
+// 强制归一化语义类别
 const canonicalizeCategory = (label: string, rawCategory?: string): string => {
   const t = String(label || '').trim();
   if (/妻子|老婆|夫人|娘子|内人|爱人|伴侣|丈夫|老公|夫君|官人|相公|夫妻|配偶/.test(t)) return 'spouse';
@@ -214,7 +266,6 @@ const parseDateToDecimal = (dateStr: string): number => {
   const nums = cleanStr.match(/\d+/g) || [];
   if (nums.length === 0) return 0;
 
-  // 使用三元表达式和非空断言，确保传入的是字符串
   const y = parseInt(nums[0] || '0', 10) || 0;
   const m = nums.length > 1 ? Math.min(12, Math.max(1, parseInt(nums[1] || '1', 10))) : 1;
   const d = nums.length > 2 ? Math.min(31, Math.max(1, parseInt(nums[2] || '1', 10))) : 1;
@@ -236,7 +287,6 @@ const isTimeStrActive = (timeStr: string, currentYear: number): boolean => {
   if (!trimmed || trimmed.includes('固定')) return true;
   const rangeParts = trimmed.split(/[～~]/);
   if (rangeParts.length >= 2) {
-    // 确保有值
     const startPart = rangeParts[0] || '';
     const endPart = rangeParts[1] || '';
     const startDec = parseDateToDecimal(startPart);
@@ -405,9 +455,9 @@ const analyzeRelationLocally = (
 
 // ---------------- 主工作区组件 ----------------
 function RelateTimeWorkspace({ plugin }: { plugin: any }) {
-  // 读取上次保存的持久化 UI 设置（若存在则自动恢复）
   const savedUi = useMemo(() => plugin?.settings?.uiState || {}, [plugin]);
 
+  const workspaceRootRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<SVGGElement>(null);
   const timelineWrapRef = useRef<HTMLDivElement>(null);
@@ -417,6 +467,36 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
 
   const [rawFiles, setRawFiles] = useState<any[]>([]);
   const [isPanelOpen, setIsPanelOpen] = useState<boolean>(() => savedUi.isPanelOpen ?? false);
+
+  // 视图模式切换：'graph' (图谱) | 'list' (列表)
+  const [viewMode, setViewMode] = useState<'graph' | 'list'>(() => savedUi.viewMode ?? 'graph');
+
+  // 列表视图专属状态与排序状态（独立记忆 customManualOrder）
+  const [listSearchQuery, setListSearchQuery] = useState<string>(() => savedUi.listSearchQuery ?? '');
+  const [listSearchScope, setListSearchScope] = useState<'all' | 'character' | 'relation'>(() => savedUi.listSearchScope ?? 'all');
+  const [listShowTime, setListShowTime] = useState<boolean>(() => savedUi.listShowTime ?? false);
+  const [listSortMode, setListSortMode] = useState<ListSortMode>(() => savedUi.listSortMode ?? 'explorer');
+  const [customManualOrder, setCustomManualOrder] = useState<string[]>(() =>
+    Array.isArray(savedUi.customManualOrder) ? savedUi.customManualOrder : []
+  );
+  const [explorerOrderTokens, setExplorerOrderTokens] = useState<string[]>([]);
+  const [nativeSortRule, setNativeSortRule] = useState<string>('alphabetical');
+  const [isSortingList, setIsSortingList] = useState<boolean>(false);
+  const [hoveredRowIdForDrag, setHoveredRowIdForDrag] = useState<string | null>(null);
+  const dragHoverTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  // 列表拖拽状态
+  const [draggedRowId, setDraggedRowId] = useState<string | null>(null);
+  const [dragOverRowId, setDragOverRowId] = useState<string | null>(null);
+
+  const [selectedListRowId, setSelectedListRowId] = useState<string | null>(null);
+  const [selectedListCell, setSelectedListCell] = useState<{ rowId: string; colId: string } | null>(null);
+  const [timeTooltip, setTimeTooltip] = useState<{ visible: boolean; x: number; y: number; text: string }>({
+    visible: false,
+    x: 0,
+    y: 0,
+    text: '',
+  });
 
   const [llmSemanticMap, setLlmSemanticMap] = useState<Record<string, SemanticCacheEntry>>(() => {
     return plugin?.settings?.llmCache?.semanticMap || {};
@@ -435,7 +515,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     reason: string;
   }>({ visible: false, x: 0, y: 0, title: '', reason: '' });
 
-  // 1. 筛选设置（全部从 savedUi 恢复）
+  // 1. 筛选设置
   const [searchQuery, setSearchQuery] = useState<string>(() => savedUi.searchQuery ?? '');
   const [showIsolated, setShowIsolated] = useState<boolean>(() => savedUi.showIsolated ?? true);
   const [enableInferred, setEnableInferred] = useState<boolean>(() => savedUi.enableInferred ?? true);
@@ -469,7 +549,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
   const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null);
   const activeNodeId = draggingNodeId || hoveredNodeId || selectedNodeId;
 
-  // 6. 时间轴与范围设置（支持持久化）
+  // 6. 时间轴与范围设置
   const [currentYear, setCurrentYear] = useState<number>(() => savedUi.currentYear ?? getTodayDecimalYear());
   const [viewSpan, setViewSpan] = useState<number>(() => savedUi.viewSpan ?? 12);
   const [startYMD, setStartYMD] = useState<YMDState>(
@@ -488,10 +568,26 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
   const minRangeDecimal = useMemo(() => ymdToDecimal(startYMD), [startYMD]);
   const maxRangeDecimal = useMemo(() => Math.max(minRangeDecimal + 0.01, ymdToDecimal(endYMD)), [endYMD, minRangeDecimal]);
 
-  // 自动持久化保存所有图谱 UI 设置到 Obsidian 的 data.json，下次打开 100% 还原
+  // 计算相对于 workspaceRootRef 的精准鼠标坐标，彻底解决容器偏移导致 Tooltip 离鼠标太远的问题
+  const getRelativeMousePos = useCallback((clientX: number, clientY: number) => {
+    const rect = workspaceRootRef.current?.getBoundingClientRect();
+    if (!rect) return { x: clientX + 12, y: clientY + 12 };
+    return {
+      x: Math.min(rect.width - 240, Math.max(8, clientX - rect.left + 12)),
+      y: Math.min(rect.height - 60, Math.max(8, clientY - rect.top + 14)),
+    };
+  }, []);
+
+  // 自动持久化保存所有图谱与列表 UI 设置（含 customManualOrder 与 listSortMode）
   useEffect(() => {
     if (!plugin || !plugin.settings) return;
     const nextUiState = {
+      viewMode,
+      listSearchQuery,
+      listSearchScope,
+      listShowTime,
+      listSortMode,
+      customManualOrder,
       isPanelOpen,
       searchQuery,
       showIsolated,
@@ -526,6 +622,12 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     return () => clearTimeout(saveTimer);
   }, [
     plugin,
+    viewMode,
+    listSearchQuery,
+    listSearchScope,
+    listShowTime,
+    listSortMode,
+    customManualOrder,
     isPanelOpen,
     searchQuery,
     showIsolated,
@@ -551,6 +653,86 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     endYMD,
     jumpYMD,
   ]);
+
+  // 三级穿透读取“与文件管理器一致（含 Flexplorer 自定义排序）”，无需打开左侧边栏即可生效
+  const syncExplorerOrder = useCallback(async () => {
+    if (!plugin?.app) return;
+    const app = plugin.app;
+    const tokens: string[] = [];
+
+    try {
+      // 第一级：直接穿透读取已加载的 Flexplorer / Custom Sort 插件内存配置
+      const customPlugins = ['flexplorer', 'custom-frames', 'sort-and-permute-files', 'custom-sort'];
+      const loadedPlugins = (app as any).plugins?.plugins || {};
+      for (const pid of customPlugins) {
+        const inst = loadedPlugins[pid];
+        if (inst) {
+          extractOrderStringsFromObject(inst.settings || inst.data || inst, tokens);
+        }
+      }
+
+      // 第二级：直接从本地磁盘读取 .obsidian/plugins/flexplorer/data.json（即使插件未暴露内存或边栏关闭也 100% 读到）
+      const configDir = app.vault.configDir || '.obsidian';
+      const flexDataPath = `${configDir}/plugins/flexplorer/data.json`;
+      if (await app.vault.adapter.exists(flexDataPath)) {
+        const rawJson = await app.vault.adapter.read(flexDataPath);
+        const parsed = JSON.parse(rawJson);
+        extractOrderStringsFromObject(parsed, tokens);
+      }
+
+      // 第三级：如果 file-explorer 视图存在，补充读取其树状顺序及 DOM 顺序
+      const explorerLeaves = app.workspace.getLeavesOfType('file-explorer');
+      if (explorerLeaves.length > 0) {
+        const view: any = explorerLeaves[0]?.view;
+        if (view?.containerEl) {
+          const domNodes = view.containerEl.querySelectorAll('.nav-file-title[data-path]');
+          domNodes.forEach((el: Element) => {
+            const p = el.getAttribute('data-path');
+            if (p) tokens.push(p);
+          });
+        }
+        if (view?.fileItems) {
+          Object.keys(view.fileItems).forEach((p) => tokens.push(p));
+        }
+      }
+
+      // 读取 Obsidian 原生文件管理器排序规则作为兜底
+      const nativeSort = (app.vault as any).getConfig?.('fileSortOrder') || 'alphabetical';
+      setNativeSortRule(String(nativeSort));
+    } catch (e) {
+      console.warn('读取文件管理器排序配置异常:', e);
+    }
+
+    setExplorerOrderTokens(Array.from(new Set(tokens)));
+  }, [plugin]);
+
+  useEffect(() => {
+    // 初始和依赖变化时同步一次
+    syncExplorerOrder();
+    
+    if (!plugin || !plugin.app) return;
+    
+    // 监听文件系统变动（应对 Flexplorer 排序文件更新）
+    const handleChange = () => syncExplorerOrder();
+    const eventRef = plugin.app.vault.on('modify', handleChange);
+    
+    // 监听焦点变化（应对拖拽操作结束）
+    const layoutRef = plugin.app.workspace.on('layout-change', handleChange);
+
+    return () => {
+      plugin.app.vault.offref(eventRef);
+      plugin.app.workspace.offref(layoutRef);
+    };
+  }, [syncExplorerOrder, rawFiles, listSortMode, viewMode, plugin]);
+
+  // 触发带短暂 Loading 反馈的排序切换函数
+  const triggerSortWithLoading = useCallback((nextMode: ListSortMode) => {
+    setIsSortingList(true);
+    setListSortMode(nextMode);
+    setTimeout(() => {
+      setIsSortingList(false);
+    }, 180);
+  }, []);
 
   // 隐藏 Obsidian 右下角状态栏
   useEffect(() => {
@@ -638,6 +820,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
               file,
               path: file.path,
               basename: file.basename,
+              stat: file.stat || { ctime: 0, mtime: 0 },
               frontmatter: cache?.frontmatter || {},
             };
           })
@@ -753,7 +936,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
           if (!targetRawName || !relType) return;
 
           const dateMatch = trimmed.match(/[（(](.*?)[)）]/);
-          // 添加 ! 非空断言，因为如果 dateMatch 存在，[1] 也一定存在
           const timeStr = dateMatch ? dateMatch[1]!.trim() : '固定';
 
           const srcId = aliasToId[targetRawName] || aliasToId[cleanName(targetRawName)];
@@ -856,7 +1038,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
           if (!cleanLabel) return;
           if (forbiddenTransitiveWords.some((w) => cleanLabel.includes(w))) return;
 
-          // 强制通过 canonicalizeCategory 统一语义类别名，杜绝与本地类别名不一致导致的重复连线！
           const cat = canonicalizeCategory(cleanLabel, rel.category);
           if (cat === 'friend' || cat === 'enemy') return;
 
@@ -904,7 +1085,9 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     [plugin]
   );
 
+  // 仅当插件设置中开启了 autoLlmInfer 时，才在文件变更后自动请求
   useEffect(() => {
+    if (!plugin?.settings?.autoLlmInfer) return;
     if (!currentFingerprint) return;
     const cachedFp = plugin?.settings?.llmCache?.fingerprint || '';
     if (cachedFp === currentFingerprint) return;
@@ -978,7 +1161,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
         if (!targetRawName || !relType) return;
 
         const dateMatch = trimmed.match(/[（(](.*?)[)）]/);
-        // 添加 ! 非空断言，因为如果 dateMatch 存在，[1] 也一定存在
         const timeStr = dateMatch ? dateMatch[1]!.trim() : '固定';
 
         const mappedSrcId = aliasToId[targetRawName] || aliasToId[cleanName(targetRawName)];
@@ -992,7 +1174,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
           const edgeKey = `${srcId}->${tgtId}:${relType}`;
           const llmEntry = llmSemanticMap[edgeKey];
 
-          // 强制通过 canonicalizeCategory 锁定唯一标准语义组，彻底杜绝因大模型分类名差异导致的重复线！
           const finalCategory = canonicalizeCategory(relType, llmEntry?.category || localAnalysis.category);
           const finalReverse = localAnalysis.reverseLabel || llmEntry?.reverseLabel || '';
           const finalConflict = localAnalysis.conflictReason || llmEntry?.conflictReason || '';
@@ -1058,7 +1239,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
 
     const finalEdges: RawRelationEdge[] = explicitEdges.map(({ reverseLabel, category, ...rest }) => rest);
 
-// 一对一直接反向推算（严格继承本体关系的 timeStr，确保推算关系与本体关系在任何时间点 100% 同步生灭！）
+    // 一对一直接反向推算
     explicitEdges.forEach((rec) => {
       if (!rec.reverseLabel) return;
       const hasReverseExactTime = finalEdges.some(
@@ -1076,7 +1257,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
           label: rec.reverseLabel,
           isInferred: true,
           inferScope: 'partial',
-          timeStr: rec.timeStr, // 100% 绑定本体时间
+          timeStr: rec.timeStr,
           pairGroupId: rec.pairGroupId,
           conflictReason: rec.conflictReason,
         });
@@ -1086,589 +1267,610 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     return finalEdges;
   }, [rawFiles, llmSemanticMap]);
 
-  // ---------------- 第二阶段：全网络传递推算 + 终极去重 + 均匀槽位几何排版 ----------------
-  const { nodes, links } = useMemo(() => {
+  // ---------------- 第二阶段：全网络传递推算 + 图谱与列表数据分发 ----------------
+  const { nodes, links, allCharacterNodes, fullTimeMatrixMap } = useMemo(() => {
     const idToDisplay: Record<string, string> = {};
     const idToGender: Record<string, '男' | '女' | '未知'> = {};
+    const idToAliases: Record<string, string[]> = {};
 
     rawFiles.forEach((f) => {
       const fm = f.frontmatter || {};
       const rawTitle = fm['character-name'] || fm['title'] || fm['name'] || cleanName(f.basename);
-      idToDisplay[f.basename] = String(rawTitle).trim() || cleanName(f.basename);
+      const disp = String(rawTitle).trim() || cleanName(f.basename);
+      idToDisplay[f.basename] = disp;
       idToGender[f.basename] = normalizeGender(fm['性别'] ?? fm['gender']);
+      idToAliases[f.basename] = extractAliases(fm, disp);
     });
 
-    let activeNodes: NodeData[] = rawFiles.map((f) => ({
+    const baseCharacters: NodeData[] = rawFiles.map((f) => ({
       id: f.basename,
       label: idToDisplay[f.basename] || f.basename,
       realName: f.basename,
+      path: f.path || f.basename,
       gender: idToGender[f.basename] || '未知',
+      aliases: idToAliases[f.basename] || [],
+      ctime: f.stat?.ctime || 0,
+      mtime: f.stat?.mtime || 0,
       isIsolated: true,
     }));
 
-    const nodeIdSet = new Set(activeNodes.map((n) => n.id));
+    const nodeIdSet = new Set(baseCharacters.map((n) => n.id));
 
-    const timeFiltered = baseResolvedEdges.filter((rec) => {
-      if (!enableInferred && rec.isInferred) return false;
-      if (!nodeIdSet.has(rec.sourceId) || !nodeIdSet.has(rec.targetId)) return false;
-      return isTimeStrActive(rec.timeStr, currentYear);
-    });
+    const computeResolvedEdgeMap = (filterByCurrentYear: boolean): Record<string, RawRelationEdge> => {
+      const filtered = baseResolvedEdges.filter((rec) => {
+        if (!enableInferred && rec.isInferred) return false;
+        if (!nodeIdSet.has(rec.sourceId) || !nodeIdSet.has(rec.targetId)) return false;
+        return filterByCurrentYear ? isTimeStrActive(rec.timeStr, currentYear) : true;
+      });
 
-    const dirGroupMap: Record<string, RawRelationEdge> = {};
-    // 关键去重规则：同一方向 (sourceId -> targetId) + 同一归一化语义组 (pairGroupId)，只保留唯一一条边！
-    // 若已有显式边或已有推算边，绝不重复叠加同义词（如有了“大哥”绝不再拼“/ 兄弟”，有了“丈夫”绝不画第二条“丈夫”）
-    const addOrMergeEdge = (edge: RawRelationEdge) => {
-      const normCat = canonicalizeCategory(edge.label);
-      const normPairGroupId = `${[edge.sourceId, edge.targetId].sort().join('__')}__${normCat}`;
-      const normalizedEdge: RawRelationEdge = { ...edge, pairGroupId: normPairGroupId };
+      const dirGroupMap: Record<string, RawRelationEdge> = {};
 
-      const k = `${normalizedEdge.sourceId}->${normalizedEdge.targetId}__${normPairGroupId}`;
-      if (!dirGroupMap[k]) {
-        dirGroupMap[k] = normalizedEdge;
-      } else {
-        const existing = dirGroupMap[k];
-        // 如果新来的是显式手写关系，而原本是推算关系，则用显式关系覆盖推算关系！
-        if (!normalizedEdge.isInferred && existing.isInferred) {
-          dirGroupMap[k] = {
-            ...normalizedEdge,
-            conflictReason: normalizedEdge.conflictReason || existing.conflictReason,
-          };
-        } else if (!normalizedEdge.isInferred && !existing.isInferred) {
-          // 两条都是手写显式关系且在同一语义组（极少见）：仅在文字不同时合并
-          const parts = existing.label.split(' / ');
-          if (!parts.includes(normalizedEdge.label)) {
-            existing.label = [...parts, normalizedEdge.label].join(' / ');
-          }
-          if (normalizedEdge.conflictReason && !existing.conflictReason) {
-            existing.conflictReason = normalizedEdge.conflictReason;
-          }
-        }
-        // 如果新来的是推算关系，而该方向该语义组已经有关系了，直接忽略，防止产生重复线！
-      }
-    };
+      const addOrMergeEdge = (edge: RawRelationEdge) => {
+        const normCat = canonicalizeCategory(edge.label);
+        const normPairGroupId = `${[edge.sourceId, edge.targetId].sort().join('__')}__${normCat}`;
+        const normalizedEdge: RawRelationEdge = { ...edge, pairGroupId: normPairGroupId };
 
-    timeFiltered.forEach(addOrMergeEdge);
+        const k = filterByCurrentYear
+          ? `${normalizedEdge.sourceId}->${normalizedEdge.targetId}__${normPairGroupId}`
+          : `${normalizedEdge.sourceId}->${normalizedEdge.targetId}__${normPairGroupId}__${normalizedEdge.timeStr}`;
 
-    // 全人物传递推算
-    if (enableInferred) {
-      const parentRoleWords = ['父亲', '爸爸', '爹', '母亲', '妈妈', '娘', '父母'];
-      const masterRoleWords = ['师父', '师傅', '老师', '师尊'];
-      const spouseRoleWords = ['妻子', '老婆', '夫人', '丈夫', '老公', '夫妻', '配偶'];
-
-      let changed = true;
-      let passCount = 0;
-      const maxPasses = Math.max(4, activeNodes.length);
-
-      while (changed && passCount < maxPasses) {
-        changed = false;
-        passCount++;
-        const currentEdges = Object.values(dirGroupMap);
-        const newlyInferred: RawRelationEdge[] = [];
-
-        const siblingEdges = currentEdges.filter(
-          (e) => e.pairGroupId.endsWith('__sibling') && !e.label.includes('表') && !e.label.includes('义')
-        );
-        const parentEdges = currentEdges.filter(
-          (e) => e.pairGroupId.endsWith('__parent_child') && parentRoleWords.some((w) => e.label.includes(w))
-        );
-        const spouseEdges = currentEdges.filter(
-          (e) => e.pairGroupId.endsWith('__spouse') && spouseRoleWords.some((w) => e.label.includes(w))
-        );
-        const masterEdges = currentEdges.filter(
-          (e) => e.pairGroupId.endsWith('__master_disciple') && masterRoleWords.some((w) => e.label.includes(w))
-        );
-
-        const siblingAdj: Record<string, Set<string>> = {};
-        siblingEdges.forEach((e) => {
-          if (!siblingAdj[e.sourceId]) siblingAdj[e.sourceId] = new Set();
-          if (!siblingAdj[e.targetId]) siblingAdj[e.targetId] = new Set();
-          siblingAdj[e.sourceId]!.add(e.targetId); // 加上感叹号
-          siblingAdj[e.targetId]!.add(e.sourceId); // 加上感叹号
-        });
-
-        const getAllConnectedSiblings = (startId: string): string[] => {
-          const visited = new Set<string>([startId]);
-          const queue = [startId];
-          while (queue.length > 0) {
-            const curr = queue.shift()!;
-            const neighbors = siblingAdj[curr];
-            if (neighbors) {
-              neighbors.forEach((nb) => {
-                if (!visited.has(nb)) {
-                  visited.add(nb);
-                  queue.push(nb);
-                }
-              });
+        if (!dirGroupMap[k]) {
+          dirGroupMap[k] = normalizedEdge;
+        } else {
+          const existing = dirGroupMap[k];
+          if (!normalizedEdge.isInferred && existing.isInferred) {
+            dirGroupMap[k] = {
+              ...normalizedEdge,
+              conflictReason: normalizedEdge.conflictReason || existing.conflictReason,
+            };
+          } else if (!normalizedEdge.isInferred && !existing.isInferred) {
+            const parts = existing.label.split(' / ');
+            if (!parts.includes(normalizedEdge.label)) {
+              existing.label = [...parts, normalizedEdge.label].join(' / ');
+            }
+            if (normalizedEdge.conflictReason && !existing.conflictReason) {
+              existing.conflictReason = normalizedEdge.conflictReason;
             }
           }
-          visited.delete(startId);
-          return Array.from(visited);
+        }
+      };
+
+      filtered.forEach(addOrMergeEdge);
+
+      if (enableInferred) {
+        const parentRoleWords = ['父亲', '爸爸', '爹', '母亲', '妈妈', '娘', '父母'];
+        const masterRoleWords = ['师父', '师傅', '老师', '师尊'];
+        const spouseRoleWords = ['妻子', '老婆', '夫人', '丈夫', '老公', '夫妻', '配偶'];
+
+        const hasPairGroupEdge = (u: string, v: string, pg: string) => {
+          if (filterByCurrentYear) return Boolean(dirGroupMap[`${u}->${v}__${pg}`]);
+          const prefix = `${u}->${v}__${pg}__`;
+          return Object.keys(dirGroupMap).some((key) => key.startsWith(prefix));
         };
 
+        let changed = true;
+        let passCount = 0;
+        const maxPasses = Math.max(4, baseCharacters.length);
+
+        while (changed && passCount < maxPasses) {
+          changed = false;
+          passCount++;
+          const currentEdges = Object.values(dirGroupMap);
+          const newlyInferred: RawRelationEdge[] = [];
+
+          const siblingEdges = currentEdges.filter(
+            (e) => e.pairGroupId.endsWith('__sibling') && !e.label.includes('表') && !e.label.includes('义')
+          );
+          const parentEdges = currentEdges.filter(
+            (e) => e.pairGroupId.endsWith('__parent_child') && parentRoleWords.some((w) => e.label.includes(w))
+          );
+          const spouseEdges = currentEdges.filter(
+            (e) => e.pairGroupId.endsWith('__spouse') && spouseRoleWords.some((w) => e.label.includes(w))
+          );
+          const masterEdges = currentEdges.filter(
+            (e) => e.pairGroupId.endsWith('__master_disciple') && masterRoleWords.some((w) => e.label.includes(w))
+          );
+
+          const siblingAdj: Record<string, Set<string>> = {};
+          siblingEdges.forEach((e) => {
+            if (!siblingAdj[e.sourceId]) siblingAdj[e.sourceId] = new Set();
+            if (!siblingAdj[e.targetId]) siblingAdj[e.targetId] = new Set();
+            siblingAdj[e.sourceId]!.add(e.targetId);
+            siblingAdj[e.targetId]!.add(e.sourceId);
+          });
+
+          const getAllConnectedSiblings = (startId: string): string[] => {
+            const visited = new Set<string>([startId]);
+            const queue = [startId];
+            while (queue.length > 0) {
+              const curr = queue.shift()!;
+              const neighbors = siblingAdj[curr];
+              if (neighbors) {
+                neighbors.forEach((nb) => {
+                  if (!visited.has(nb)) {
+                    visited.add(nb);
+                    queue.push(nb);
+                  }
+                });
+              }
+            }
+            visited.delete(startId);
+            return Array.from(visited);
+          };
+
+          if (inferDisplayMode === 'all') {
+            Object.keys(siblingAdj).forEach((u) => {
+              const allSibs = getAllConnectedSiblings(u);
+              allSibs.forEach((v) => {
+                const sibGroup = `${[u, v].sort().join('__')}__sibling`;
+                if (!hasPairGroupEdge(u, v, sibGroup)) {
+                  const uGender = idToGender[u] || '未知';
+                  const lbl = uGender === '男' ? '兄弟' : uGender === '女' ? '姐妹' : '手足';
+                  newlyInferred.push({
+                    key: `trans_sib:${u}->${v}`,
+                    sourceId: u,
+                    targetId: v,
+                    label: lbl,
+                    isInferred: true,
+                    inferScope: 'all',
+                    timeStr: '固定',
+                    pairGroupId: sibGroup,
+                    conflictReason: '',
+                  });
+                }
+              });
+            });
+          }
+
+          parentEdges.forEach((pEdge) => {
+            const parentId = pEdge.sourceId;
+            const childA = pEdge.targetId;
+            const parentLabel = pEdge.label;
+            const allSiblingsOfA = getAllConnectedSiblings(childA);
+
+            allSiblingsOfA.forEach((childB) => {
+              if (childB === parentId) return;
+              const pbPairGroup = `${[parentId, childB].sort().join('__')}__parent_child`;
+              if (!hasPairGroupEdge(parentId, childB, pbPairGroup)) {
+                newlyInferred.push({
+                  key: `trans:${parentId}->${childB}:${parentLabel}`,
+                  sourceId: parentId,
+                  targetId: childB,
+                  label: parentLabel,
+                  isInferred: true,
+                  inferScope: 'partial',
+                  timeStr: '固定',
+                  pairGroupId: pbPairGroup,
+                  conflictReason: '',
+                });
+              }
+              if (!hasPairGroupEdge(childB, parentId, pbPairGroup)) {
+                const bGender = idToGender[childB] || '未知';
+                const childLabel = bGender === '男' ? '儿子' : bGender === '女' ? '女儿' : '子女';
+                newlyInferred.push({
+                  key: `trans:${childB}->${parentId}:${childLabel}`,
+                  sourceId: childB,
+                  targetId: parentId,
+                  label: childLabel,
+                  isInferred: true,
+                  inferScope: 'partial',
+                  timeStr: '固定',
+                  pairGroupId: pbPairGroup,
+                  conflictReason: '',
+                });
+              }
+            });
+          });
+
+          parentEdges.forEach((pEdge) => {
+            const p1 = pEdge.sourceId;
+            const childId = pEdge.targetId;
+            spouseEdges.forEach((sEdge) => {
+              if (sEdge.conflictReason) return;
+              const p2 = sEdge.sourceId === p1 ? sEdge.targetId : sEdge.targetId === p1 ? sEdge.sourceId : null;
+              if (!p2 || p2 === childId) return;
+
+              const p2ChildGroup = `${[p2, childId].sort().join('__')}__parent_child`;
+              if (!hasPairGroupEdge(p2, childId, p2ChildGroup)) {
+                const p2Gender = idToGender[p2] || '未知';
+                const p2Label = p2Gender === '男' ? '父亲' : p2Gender === '女' ? '母亲' : '父母';
+                newlyInferred.push({
+                  key: `trans_sp_parent:${p2}->${childId}`,
+                  sourceId: p2,
+                  targetId: childId,
+                  label: p2Label,
+                  isInferred: true,
+                  inferScope: 'partial',
+                  timeStr: '固定',
+                  pairGroupId: p2ChildGroup,
+                  conflictReason: '',
+                });
+              }
+              if (!hasPairGroupEdge(childId, p2, p2ChildGroup)) {
+                const cGender = idToGender[childId] || '未知';
+                const cLabel = cGender === '男' ? '儿子' : cGender === '女' ? '女儿' : '子女';
+                newlyInferred.push({
+                  key: `trans_sp_child:${childId}->${p2}`,
+                  sourceId: childId,
+                  targetId: p2,
+                  label: cLabel,
+                  isInferred: true,
+                  inferScope: 'partial',
+                  timeStr: '固定',
+                  pairGroupId: p2ChildGroup,
+                  conflictReason: '',
+                });
+              }
+            });
+          });
+
+          for (let i = 0; i < parentEdges.length; i++) {
+            for (let j = i + 1; j < parentEdges.length; j++) {
+              const p1 = parentEdges[i]!;
+              const p2 = parentEdges[j]!;
+              if (p1.sourceId === p2.sourceId) {
+                const c1 = p1.targetId;
+                const c2 = p2.targetId;
+                if (c1 === c2) continue;
+                const sibGroup = `${[c1, c2].sort().join('__')}__sibling`;
+                if (!hasPairGroupEdge(c1, c2, sibGroup) && !hasPairGroupEdge(c2, c1, sibGroup)) {
+                  const g1 = idToGender[c1] || '未知';
+                  const g2 = idToGender[c2] || '未知';
+                  newlyInferred.push({
+                    key: `trans_p_sib:${c1}->${c2}`,
+                    sourceId: c1,
+                    targetId: c2,
+                    label: g1 === '男' ? '兄弟' : g1 === '女' ? '姐妹' : '手足',
+                    isInferred: true,
+                    inferScope: 'partial',
+                    timeStr: '固定',
+                    pairGroupId: sibGroup,
+                    conflictReason: '',
+                  });
+                  newlyInferred.push({
+                    key: `trans_p_sib:${c2}->${c1}`,
+                    sourceId: c2,
+                    targetId: c1,
+                    label: g2 === '男' ? '兄弟' : g2 === '女' ? '姐妹' : '手足',
+                    isInferred: true,
+                    inferScope: 'partial',
+                    timeStr: '固定',
+                    pairGroupId: sibGroup,
+                    conflictReason: '',
+                  });
+                }
+              }
+            }
+          }
+
+          for (let i = 0; i < masterEdges.length; i++) {
+            for (let j = i + 1; j < masterEdges.length; j++) {
+              const m1 = masterEdges[i]!;
+              const m2 = masterEdges[j]!;
+              if (m1.sourceId === m2.sourceId) {
+                const d1 = m1.targetId;
+                const d2 = m2.targetId;
+                if (d1 === d2) continue;
+                const peerGroup = `${[d1, d2].sort().join('__')}__sect_peer`;
+                if (!hasPairGroupEdge(d1, d2, peerGroup)) {
+                  newlyInferred.push({
+                    key: `trans_peer:${d1}->${d2}`,
+                    sourceId: d1,
+                    targetId: d2,
+                    label: '同门',
+                    isInferred: true,
+                    inferScope: 'partial',
+                    timeStr: '固定',
+                    pairGroupId: peerGroup,
+                    conflictReason: '',
+                  });
+                }
+                if (!hasPairGroupEdge(d2, d1, peerGroup)) {
+                  newlyInferred.push({
+                    key: `trans_peer:${d2}->${d1}`,
+                    sourceId: d2,
+                    targetId: d1,
+                    label: '同门',
+                    isInferred: true,
+                    inferScope: 'partial',
+                    timeStr: '固定',
+                    pairGroupId: peerGroup,
+                    conflictReason: '',
+                  });
+                }
+              }
+            }
+          }
+
+          const prevCount = Object.keys(dirGroupMap).length;
+          newlyInferred.forEach(addOrMergeEdge);
+          if (Object.keys(dirGroupMap).length > prevCount) {
+            changed = true;
+          }
+        }
+
         if (inferDisplayMode === 'all') {
-          Object.keys(siblingAdj).forEach((u) => {
-            const allSibs = getAllConnectedSiblings(u);
-            allSibs.forEach((v) => {
-              const sibGroup = `${[u, v].sort().join('__')}__sibling`;
-              if (!dirGroupMap[`${u}->${v}__${sibGroup}`]) {
-                const uGender = idToGender[u] || '未知';
-                const lbl = uGender === '男' ? '兄弟' : uGender === '女' ? '姐妹' : '手足';
-                newlyInferred.push({
-                  key: `trans_sib:${u}->${v}`,
-                  sourceId: u,
-                  targetId: v,
-                  label: lbl,
-                  isInferred: true,
-                  inferScope: 'all',
-                  timeStr: '固定',
-                  pairGroupId: sibGroup,
-                  conflictReason: '',
-                });
-              }
+          const currentEdges = Object.values(dirGroupMap);
+          const parentEdges = currentEdges.filter(
+            (e) => e.pairGroupId.endsWith('__parent_child') && parentRoleWords.some((w) => e.label.includes(w))
+          );
+          const siblingEdges = currentEdges.filter((e) => e.pairGroupId.endsWith('__sibling'));
+          const spouseEdges = currentEdges.filter((e) => e.pairGroupId.endsWith('__spouse'));
+          const masterEdges = currentEdges.filter(
+            (e) => e.pairGroupId.endsWith('__master_disciple') && masterRoleWords.some((w) => e.label.includes(w))
+          );
+
+          const extendedInferred: RawRelationEdge[] = [];
+
+          parentEdges.forEach((gpEdge) => {
+            const grandParentId = gpEdge.sourceId;
+            const parentId = gpEdge.targetId;
+            parentEdges.forEach((pEdge) => {
+              if (pEdge.sourceId !== parentId) return;
+              const grandChildId = pEdge.targetId;
+              if (grandChildId === grandParentId) return;
+
+              const gpGroup = `${[grandParentId, grandChildId].sort().join('__')}__grandparent`;
+              const isMaternal = idToGender[parentId] === '女';
+              const gpGender = idToGender[grandParentId] || '未知';
+              const gcGender = idToGender[grandChildId] || '未知';
+
+              const gpLabel =
+                gpGender === '男' ? (isMaternal ? '外公' : '祖父') : gpGender === '女' ? (isMaternal ? '外婆' : '祖母') : '祖父母';
+              const gcLabel =
+                gcGender === '男' ? (isMaternal ? '外孙' : '孙子') : gcGender === '女' ? (isMaternal ? '外孙女' : '孙女') : '孙辈';
+
+              extendedInferred.push({
+                key: `ext_gp:${grandParentId}->${grandChildId}`,
+                sourceId: grandParentId,
+                targetId: grandChildId,
+                label: gpLabel,
+                isInferred: true,
+                inferScope: 'all',
+                timeStr: '固定',
+                pairGroupId: gpGroup,
+                conflictReason: '',
+              });
+              extendedInferred.push({
+                key: `ext_gc:${grandChildId}->${grandParentId}`,
+                sourceId: grandChildId,
+                targetId: grandParentId,
+                label: gcLabel,
+                isInferred: true,
+                inferScope: 'all',
+                timeStr: '固定',
+                pairGroupId: gpGroup,
+                conflictReason: '',
+              });
             });
           });
-        }
 
-        // 兄弟姐妹共享父母
-        parentEdges.forEach((pEdge) => {
-          const parentId = pEdge.sourceId;
-          const childA = pEdge.targetId;
-          const parentLabel = pEdge.label;
-          const allSiblingsOfA = getAllConnectedSiblings(childA);
-
-          allSiblingsOfA.forEach((childB) => {
-            if (childB === parentId) return;
-            const pbPairGroup = `${[parentId, childB].sort().join('__')}__parent_child`;
-            if (!dirGroupMap[`${parentId}->${childB}__${pbPairGroup}`]) {
-              newlyInferred.push({
-                key: `trans:${parentId}->${childB}:${parentLabel}`,
-                sourceId: parentId,
-                targetId: childB,
-                label: parentLabel,
-                isInferred: true,
-                inferScope: 'partial',
-                timeStr: '固定',
-                pairGroupId: pbPairGroup,
-                conflictReason: '',
-              });
-            }
-            if (!dirGroupMap[`${childB}->${parentId}__${pbPairGroup}`]) {
-              const bGender = idToGender[childB] || '未知';
-              const childLabel = bGender === '男' ? '儿子' : bGender === '女' ? '女儿' : '子女';
-              newlyInferred.push({
-                key: `trans:${childB}->${parentId}:${childLabel}`,
-                sourceId: childB,
-                targetId: parentId,
-                label: childLabel,
-                isInferred: true,
-                inferScope: 'partial',
-                timeStr: '固定',
-                pairGroupId: pbPairGroup,
-                conflictReason: '',
-              });
-            }
-          });
-        });
-
-        // 夫妻共享无冲突亲生子女
-        parentEdges.forEach((pEdge) => {
-          const p1 = pEdge.sourceId;
-          const childId = pEdge.targetId;
-          spouseEdges.forEach((sEdge) => {
-            if (sEdge.conflictReason) return;
-            const p2 = sEdge.sourceId === p1 ? sEdge.targetId : sEdge.targetId === p1 ? sEdge.sourceId : null;
-            if (!p2 || p2 === childId) return;
-
-            const p2ChildGroup = `${[p2, childId].sort().join('__')}__parent_child`;
-            if (!dirGroupMap[`${p2}->${childId}__${p2ChildGroup}`]) {
-              const p2Gender = idToGender[p2] || '未知';
-              const p2Label = p2Gender === '男' ? '父亲' : p2Gender === '女' ? '母亲' : '父母';
-              newlyInferred.push({
-                key: `trans_sp_parent:${p2}->${childId}`,
-                sourceId: p2,
-                targetId: childId,
-                label: p2Label,
-                isInferred: true,
-                inferScope: 'partial',
-                timeStr: '固定',
-                pairGroupId: p2ChildGroup,
-                conflictReason: '',
-              });
-            }
-            if (!dirGroupMap[`${childId}->${p2}__${p2ChildGroup}`]) {
-              const cGender = idToGender[childId] || '未知';
-              const cLabel = cGender === '男' ? '儿子' : cGender === '女' ? '女儿' : '子女';
-              newlyInferred.push({
-                key: `trans_sp_child:${childId}->${p2}`,
-                sourceId: childId,
-                targetId: p2,
-                label: cLabel,
-                isInferred: true,
-                inferScope: 'partial',
-                timeStr: '固定',
-                pairGroupId: p2ChildGroup,
-                conflictReason: '',
-              });
-            }
-          });
-        });
-
-        // 同父母名下子女互为手足
-        for (let i = 0; i < parentEdges.length; i++) {
-          for (let j = i + 1; j < parentEdges.length; j++) {
-            const p1 = parentEdges[i]!;
-            const p2 = parentEdges[j]!;
-            if (p1.sourceId === p2.sourceId) {
-              const c1 = p1.targetId;
-              const c2 = p2.targetId;
-              if (c1 === c2) continue;
-              const sibGroup = `${[c1, c2].sort().join('__')}__sibling`;
-              if (!dirGroupMap[`${c1}->${c2}__${sibGroup}`] && !dirGroupMap[`${c2}->${c1}__${sibGroup}`]) {
-                const g1 = idToGender[c1] || '未知';
-                const g2 = idToGender[c2] || '未知';
-                newlyInferred.push({
-                  key: `trans_p_sib:${c1}->${c2}`,
-                  sourceId: c1,
-                  targetId: c2,
-                  label: g1 === '男' ? '兄弟' : g1 === '女' ? '姐妹' : '手足',
-                  isInferred: true,
-                  inferScope: 'partial',
-                  timeStr: '固定',
-                  pairGroupId: sibGroup,
-                  conflictReason: '',
-                });
-                newlyInferred.push({
-                  key: `trans_p_sib:${c2}->${c1}`,
-                  sourceId: c2,
-                  targetId: c1,
-                  label: g2 === '男' ? '兄弟' : g2 === '女' ? '姐妹' : '手足',
-                  isInferred: true,
-                  inferScope: 'partial',
-                  timeStr: '固定',
-                  pairGroupId: sibGroup,
-                  conflictReason: '',
-                });
-              }
-            }
-          }
-        }
-
-        // 同师父门下互为同门
-        for (let i = 0; i < masterEdges.length; i++) {
-          for (let j = i + 1; j < masterEdges.length; j++) {
-            const m1 = masterEdges[i]!;
-            const m2 = masterEdges[j]!;
-            if (m1.sourceId === m2.sourceId) {
-              const d1 = m1.targetId;
-              const d2 = m2.targetId;
-              if (d1 === d2) continue;
-              const peerGroup = `${[d1, d2].sort().join('__')}__sect_peer`;
-              if (!dirGroupMap[`${d1}->${d2}__${peerGroup}`]) {
-                newlyInferred.push({
-                  key: `trans_peer:${d1}->${d2}`,
-                  sourceId: d1,
-                  targetId: d2,
-                  label: '同门',
-                  isInferred: true,
-                  inferScope: 'partial',
-                  timeStr: '固定',
-                  pairGroupId: peerGroup,
-                  conflictReason: '',
-                });
-              }
-              if (!dirGroupMap[`${d2}->${d1}__${peerGroup}`]) {
-                newlyInferred.push({
-                  key: `trans_peer:${d2}->${d1}`,
-                  sourceId: d2,
-                  targetId: d1,
-                  label: '同门',
-                  isInferred: true,
-                  inferScope: 'partial',
-                  timeStr: '固定',
-                  pairGroupId: peerGroup,
-                  conflictReason: '',
-                });
-              }
-            }
-          }
-        }
-
-        const prevCount = Object.keys(dirGroupMap).length;
-        newlyInferred.forEach(addOrMergeEdge);
-        if (Object.keys(dirGroupMap).length > prevCount) {
-          changed = true;
-        }
-      }
-
-      // 'all' 模式下解锁跨代（祖孙/师祖）、旁系（叔伯/姑舅）与姻亲（岳父母/大舅哥/嫂子）推算
-      if (inferDisplayMode === 'all') {
-        const currentEdges = Object.values(dirGroupMap);
-        const parentEdges = currentEdges.filter(
-          (e) => e.pairGroupId.endsWith('__parent_child') && parentRoleWords.some((w) => e.label.includes(w))
-        );
-        const siblingEdges = currentEdges.filter((e) => e.pairGroupId.endsWith('__sibling'));
-        const spouseEdges = currentEdges.filter((e) => e.pairGroupId.endsWith('__spouse'));
-        const masterEdges = currentEdges.filter(
-          (e) => e.pairGroupId.endsWith('__master_disciple') && masterRoleWords.some((w) => e.label.includes(w))
-        );
-
-        const extendedInferred: RawRelationEdge[] = [];
-
-        parentEdges.forEach((gpEdge) => {
-          const grandParentId = gpEdge.sourceId;
-          const parentId = gpEdge.targetId;
           parentEdges.forEach((pEdge) => {
-            if (pEdge.sourceId !== parentId) return;
-            const grandChildId = pEdge.targetId;
-            if (grandChildId === grandParentId) return;
-
-            const gpGroup = `${[grandParentId, grandChildId].sort().join('__')}__grandparent`;
+            const parentId = pEdge.sourceId;
+            const childId = pEdge.targetId;
             const isMaternal = idToGender[parentId] === '女';
-            const gpGender = idToGender[grandParentId] || '未知';
-            const gcGender = idToGender[grandChildId] || '未知';
 
-            const gpLabel =
-              gpGender === '男' ? (isMaternal ? '外公' : '祖父') : gpGender === '女' ? (isMaternal ? '外婆' : '祖母') : '祖父母';
-            const gcLabel =
-              gcGender === '男' ? (isMaternal ? '外孙' : '孙子') : gcGender === '女' ? (isMaternal ? '外孙女' : '孙女') : '孙辈';
+            siblingEdges.forEach((sEdge) => {
+              if (sEdge.targetId !== parentId) return;
+              const uncleId = sEdge.sourceId;
+              if (uncleId === childId) return;
+              const existingPC = `${[uncleId, childId].sort().join('__')}__parent_child`;
+              if (hasPairGroupEdge(uncleId, childId, existingPC)) return;
 
-            extendedInferred.push({
-              key: `ext_gp:${grandParentId}->${grandChildId}`,
-              sourceId: grandParentId,
-              targetId: grandChildId,
-              label: gpLabel,
-              isInferred: true,
-              inferScope: 'all',
-              timeStr: '固定',
-              pairGroupId: gpGroup,
-              conflictReason: '',
-            });
-            extendedInferred.push({
-              key: `ext_gc:${grandChildId}->${grandParentId}`,
-              sourceId: grandChildId,
-              targetId: grandParentId,
-              label: gcLabel,
-              isInferred: true,
-              inferScope: 'all',
-              timeStr: '固定',
-              pairGroupId: gpGroup,
-              conflictReason: '',
-            });
-          });
-        });
+              const uaGroup = `${[uncleId, childId].sort().join('__')}__uncle_aunt`;
+              const uGender = idToGender[uncleId] || '未知';
+              const cGender = idToGender[childId] || '未知';
 
-        parentEdges.forEach((pEdge) => {
-          const parentId = pEdge.sourceId;
-          const childId = pEdge.targetId;
-          const isMaternal = idToGender[parentId] === '女';
-
-          siblingEdges.forEach((sEdge) => {
-            if (sEdge.targetId !== parentId) return;
-            const uncleId = sEdge.sourceId;
-            if (uncleId === childId) return;
-            const existingPC = `${[uncleId, childId].sort().join('__')}__parent_child`;
-            if (dirGroupMap[`${uncleId}->${childId}__${existingPC}`]) return;
-
-            const uaGroup = `${[uncleId, childId].sort().join('__')}__uncle_aunt`;
-            const uGender = idToGender[uncleId] || '未知';
-            const cGender = idToGender[childId] || '未知';
-
-            let uLabel = '长辈';
-            if (isMaternal) {
-              uLabel = uGender === '男' ? '舅舅' : uGender === '女' ? '姨母' : '舅姨';
-            } else {
-              if (uGender === '女') uLabel = '姑姑';
-              else if (sEdge.label.includes('哥') || sEdge.label.includes('兄')) uLabel = '伯父';
-              else if (sEdge.label.includes('弟')) uLabel = '叔父';
-              else uLabel = '伯叔';
-            }
-            const nephewLabel = isMaternal
-              ? cGender === '男'
-                ? '外甥'
+              let uLabel = '长辈';
+              if (isMaternal) {
+                uLabel = uGender === '男' ? '舅舅' : uGender === '女' ? '姨母' : '舅姨';
+              } else {
+                if (uGender === '女') uLabel = '姑姑';
+                else if (sEdge.label.includes('哥') || sEdge.label.includes('兄')) uLabel = '伯父';
+                else if (sEdge.label.includes('弟')) uLabel = '叔父';
+                else uLabel = '伯叔';
+              }
+              const nephewLabel = isMaternal
+                ? cGender === '男'
+                  ? '外甥'
+                  : cGender === '女'
+                  ? '外甥女'
+                  : '外甥'
+                : cGender === '男'
+                ? '侄子'
                 : cGender === '女'
-                ? '外甥女'
-                : '外甥'
-              : cGender === '男'
-              ? '侄子'
-              : cGender === '女'
-              ? '侄女'
-              : '侄辈';
+                ? '侄女'
+                : '侄辈';
 
-            extendedInferred.push({
-              key: `ext_ua:${uncleId}->${childId}`,
-              sourceId: uncleId,
-              targetId: childId,
-              label: uLabel,
-              isInferred: true,
-              inferScope: 'all',
-              timeStr: '固定',
-              pairGroupId: uaGroup,
-              conflictReason: '',
+              extendedInferred.push({
+                key: `ext_ua:${uncleId}->${childId}`,
+                sourceId: uncleId,
+                targetId: childId,
+                label: uLabel,
+                isInferred: true,
+                inferScope: 'all',
+                timeStr: '固定',
+                pairGroupId: uaGroup,
+                conflictReason: '',
+              });
+              extendedInferred.push({
+                key: `ext_nephew:${childId}->${uncleId}`,
+                sourceId: childId,
+                targetId: uncleId,
+                label: nephewLabel,
+                isInferred: true,
+                inferScope: 'all',
+                timeStr: '固定',
+                pairGroupId: uaGroup,
+                conflictReason: '',
+              });
             });
-            extendedInferred.push({
-              key: `ext_nephew:${childId}->${uncleId}`,
-              sourceId: childId,
-              targetId: uncleId,
-              label: nephewLabel,
-              isInferred: true,
-              inferScope: 'all',
-              timeStr: '固定',
-              pairGroupId: uaGroup,
-              conflictReason: '',
+          });
+
+          spouseEdges.forEach((spEdge) => {
+            const personA = spEdge.sourceId;
+            const personB = spEdge.targetId;
+
+            parentEdges.forEach((pEdge) => {
+              if (pEdge.targetId !== personA) return;
+              const inLawParent = pEdge.sourceId;
+              if (inLawParent === personB) return;
+              const existingPC = `${[inLawParent, personB].sort().join('__')}__parent_child`;
+              if (hasPairGroupEdge(inLawParent, personB, existingPC)) return;
+
+              const inLawGroup = `${[inLawParent, personB].sort().join('__')}__in_law`;
+              const pGender = idToGender[inLawParent] || '未知';
+              const bGender = idToGender[personB] || '未知';
+
+              const pLabel = bGender === '男' ? (pGender === '男' ? '岳父' : '岳母') : pGender === '男' ? '公公' : '婆婆';
+              const bLabel = bGender === '男' ? '女婿' : bGender === '女' ? '儿媳' : '婿媳';
+
+              extendedInferred.push({
+                key: `ext_inlaw_p:${inLawParent}->${personB}`,
+                sourceId: inLawParent,
+                targetId: personB,
+                label: pLabel,
+                isInferred: true,
+                inferScope: 'all',
+                timeStr: '固定',
+                pairGroupId: inLawGroup,
+                conflictReason: '',
+              });
+              extendedInferred.push({
+                key: `ext_inlaw_c:${personB}->${inLawParent}`,
+                sourceId: personB,
+                targetId: inLawParent,
+                label: bLabel,
+                isInferred: true,
+                inferScope: 'all',
+                timeStr: '固定',
+                pairGroupId: inLawGroup,
+                conflictReason: '',
+              });
             });
+
+            siblingEdges.forEach((sEdge) => {
+              if (sEdge.targetId !== personA) return;
+              const sibOfSpouse = sEdge.sourceId;
+              if (sibOfSpouse === personB) return;
+              const existingSib = `${[sibOfSpouse, personB].sort().join('__')}__sibling`;
+              if (hasPairGroupEdge(sibOfSpouse, personB, existingSib)) return;
+
+              const inLawGroup = `${[sibOfSpouse, personB].sort().join('__')}__in_law`;
+              const sGender = idToGender[sibOfSpouse] || '未知';
+              const bGender = idToGender[personB] || '未知';
+              const isOlder = sEdge.label.includes('哥') || sEdge.label.includes('兄') || sEdge.label.includes('姐');
+
+              let sToBLabel = '姻亲';
+              let bToSLabel = '姻亲';
+              if (spEdge.label.includes('妻') || spEdge.label.includes('老婆')) {
+                sToBLabel = sGender === '男' ? (isOlder ? '大舅哥' : '小舅子') : isOlder ? '大姨子' : '小姨子';
+                bToSLabel = isOlder ? '妹夫' : '姐夫';
+              } else {
+                bToSLabel = bGender === '女' ? (isOlder ? '弟妹' : '嫂子') : isOlder ? '妹夫' : '姐夫';
+                sToBLabel = sGender === '男' ? (isOlder ? '大伯哥' : '小叔子') : isOlder ? '大姑姐' : '小姑子';
+              }
+
+              extendedInferred.push({
+                key: `ext_inlaw_s1:${sibOfSpouse}->${personB}`,
+                sourceId: sibOfSpouse,
+                targetId: personB,
+                label: sToBLabel,
+                isInferred: true,
+                inferScope: 'all',
+                timeStr: '固定',
+                pairGroupId: inLawGroup,
+                conflictReason: '',
+              });
+              extendedInferred.push({
+                key: `ext_inlaw_s2:${personB}->${sibOfSpouse}`,
+                sourceId: personB,
+                targetId: sibOfSpouse,
+                label: bToSLabel,
+                isInferred: true,
+                inferScope: 'all',
+                timeStr: '固定',
+                pairGroupId: inLawGroup,
+                conflictReason: '',
+              });
+            });
+          });
+
+          masterEdges.forEach((gmEdge) => {
+            const grandMaster = gmEdge.sourceId;
+            const master = gmEdge.targetId;
+            masterEdges.forEach((mEdge) => {
+              if (mEdge.sourceId !== master) return;
+              const disciple = mEdge.targetId;
+              if (disciple === grandMaster) return;
+              const gmGroup = `${[grandMaster, disciple].sort().join('__')}__grandmaster`;
+              extendedInferred.push({
+                key: `ext_gm:${grandMaster}->${disciple}`,
+                sourceId: grandMaster,
+                targetId: disciple,
+                label: '师祖',
+                isInferred: true,
+                inferScope: 'all',
+                timeStr: '固定',
+                pairGroupId: gmGroup,
+                conflictReason: '',
+              });
+              extendedInferred.push({
+                key: `ext_gd:${disciple}->${grandMaster}`,
+                sourceId: disciple,
+                targetId: grandMaster,
+                label: '徒孙',
+                isInferred: true,
+                inferScope: 'all',
+                timeStr: '固定',
+                pairGroupId: gmGroup,
+                conflictReason: '',
+              });
+            });
+          });
+
+          extendedInferred.forEach(addOrMergeEdge);
+        }
+
+        llmGlobalInferred.forEach((gRec) => {
+          if (!nodeIdSet.has(gRec.sourceId) || !nodeIdSet.has(gRec.targetId)) return;
+          if (inferDisplayMode === 'partial' && gRec.scope === 'all') return;
+          if (filterByCurrentYear && !isTimeStrActive(gRec.timeStr, currentYear)) return;
+
+          const normCat = canonicalizeCategory(gRec.label, gRec.category);
+          const pairGroupId = `${[gRec.sourceId, gRec.targetId].sort().join('__')}__${normCat}`;
+          addOrMergeEdge({
+            key: `llm_global:${gRec.sourceId}->${gRec.targetId}:${gRec.label}`,
+            sourceId: gRec.sourceId,
+            targetId: gRec.targetId,
+            label: gRec.label,
+            isInferred: true,
+            inferScope: gRec.scope,
+            timeStr: gRec.timeStr,
+            pairGroupId,
+            conflictReason: '',
           });
         });
-
-        spouseEdges.forEach((spEdge) => {
-          const personA = spEdge.sourceId;
-          const personB = spEdge.targetId;
-
-          parentEdges.forEach((pEdge) => {
-            if (pEdge.targetId !== personA) return;
-            const inLawParent = pEdge.sourceId;
-            if (inLawParent === personB) return;
-            // 若已经是亲生父母则绝不覆盖为岳父母！
-            const existingPC = `${[inLawParent, personB].sort().join('__')}__parent_child`;
-            if (dirGroupMap[`${inLawParent}->${personB}__${existingPC}`]) return;
-
-            const inLawGroup = `${[inLawParent, personB].sort().join('__')}__in_law`;
-            const pGender = idToGender[inLawParent] || '未知';
-            const bGender = idToGender[personB] || '未知';
-
-            const pLabel = bGender === '男' ? (pGender === '男' ? '岳父' : '岳母') : pGender === '男' ? '公公' : '婆婆';
-            const bLabel = bGender === '男' ? '女婿' : bGender === '女' ? '儿媳' : '婿媳';
-
-            extendedInferred.push({
-              key: `ext_inlaw_p:${inLawParent}->${personB}`,
-              sourceId: inLawParent,
-              targetId: personB,
-              label: pLabel,
-              isInferred: true,
-              inferScope: 'all',
-              timeStr: '固定',
-              pairGroupId: inLawGroup,
-              conflictReason: '',
-            });
-            extendedInferred.push({
-              key: `ext_inlaw_c:${personB}->${inLawParent}`,
-              sourceId: personB,
-              targetId: inLawParent,
-              label: bLabel,
-              isInferred: true,
-              inferScope: 'all',
-              timeStr: '固定',
-              pairGroupId: inLawGroup,
-              conflictReason: '',
-            });
-          });
-
-          siblingEdges.forEach((sEdge) => {
-            if (sEdge.targetId !== personA) return;
-            const sibOfSpouse = sEdge.sourceId;
-            if (sibOfSpouse === personB) return;
-            // 若已经是亲兄弟姐妹则绝不覆盖为大舅哥！
-            const existingSib = `${[sibOfSpouse, personB].sort().join('__')}__sibling`;
-            if (dirGroupMap[`${sibOfSpouse}->${personB}__${existingSib}`]) return;
-
-            const inLawGroup = `${[sibOfSpouse, personB].sort().join('__')}__in_law`;
-            const sGender = idToGender[sibOfSpouse] || '未知';
-            const bGender = idToGender[personB] || '未知';
-            const isOlder = sEdge.label.includes('哥') || sEdge.label.includes('兄') || sEdge.label.includes('姐');
-
-            let sToBLabel = '姻亲';
-            let bToSLabel = '姻亲';
-            if (spEdge.label.includes('妻') || spEdge.label.includes('老婆')) {
-              sToBLabel = sGender === '男' ? (isOlder ? '大舅哥' : '小舅子') : isOlder ? '大姨子' : '小姨子';
-              bToSLabel = isOlder ? '妹夫' : '姐夫';
-            } else {
-              bToSLabel = bGender === '女' ? (isOlder ? '弟妹' : '嫂子') : isOlder ? '妹夫' : '姐夫';
-              sToBLabel = sGender === '男' ? (isOlder ? '大伯哥' : '小叔子') : isOlder ? '大姑姐' : '小姑子';
-            }
-
-            extendedInferred.push({
-              key: `ext_inlaw_s1:${sibOfSpouse}->${personB}`,
-              sourceId: sibOfSpouse,
-              targetId: personB,
-              label: sToBLabel,
-              isInferred: true,
-              inferScope: 'all',
-              timeStr: '固定',
-              pairGroupId: inLawGroup,
-              conflictReason: '',
-            });
-            extendedInferred.push({
-              key: `ext_inlaw_s2:${personB}->${sibOfSpouse}`,
-              sourceId: personB,
-              targetId: sibOfSpouse,
-              label: bToSLabel,
-              isInferred: true,
-              inferScope: 'all',
-              timeStr: '固定',
-              pairGroupId: inLawGroup,
-              conflictReason: '',
-            });
-          });
-        });
-
-        masterEdges.forEach((gmEdge) => {
-          const grandMaster = gmEdge.sourceId;
-          const master = gmEdge.targetId;
-          masterEdges.forEach((mEdge) => {
-            if (mEdge.sourceId !== master) return;
-            const disciple = mEdge.targetId;
-            if (disciple === grandMaster) return;
-            const gmGroup = `${[grandMaster, disciple].sort().join('__')}__grandmaster`;
-            extendedInferred.push({
-              key: `ext_gm:${grandMaster}->${disciple}`,
-              sourceId: grandMaster,
-              targetId: disciple,
-              label: '师祖',
-              isInferred: true,
-              inferScope: 'all',
-              timeStr: '固定',
-              pairGroupId: gmGroup,
-              conflictReason: '',
-            });
-            extendedInferred.push({
-              key: `ext_gd:${disciple}->${grandMaster}`,
-              sourceId: disciple,
-              targetId: grandMaster,
-              label: '徒孙',
-              isInferred: true,
-              inferScope: 'all',
-              timeStr: '固定',
-              pairGroupId: gmGroup,
-              conflictReason: '',
-            });
-          });
-        });
-
-        extendedInferred.forEach(addOrMergeEdge);
       }
 
-      // 融合大模型全局知识图谱缓存（强制通过 addOrMergeEdge 归一化去重，绝不产生重复的同门/丈夫/弟弟！）
-      llmGlobalInferred.forEach((gRec) => {
-        if (!nodeIdSet.has(gRec.sourceId) || !nodeIdSet.has(gRec.targetId)) return;
-        if (inferDisplayMode === 'partial' && gRec.scope === 'all') return;
-        if (!isTimeStrActive(gRec.timeStr, currentYear)) return;
+      return dirGroupMap;
+    };
 
-        const normCat = canonicalizeCategory(gRec.label, gRec.category);
-        const pairGroupId = `${[gRec.sourceId, gRec.targetId].sort().join('__')}__${normCat}`;
-        addOrMergeEdge({
-          key: `llm_global:${gRec.sourceId}->${gRec.targetId}:${gRec.label}`,
-          sourceId: gRec.sourceId,
-          targetId: gRec.targetId,
-          label: gRec.label,
-          isInferred: true,
-          inferScope: gRec.scope,
-          timeStr: gRec.timeStr,
-          pairGroupId,
-          conflictReason: '',
-        });
-      });
-    }
+    const dirGroupMap = computeResolvedEdgeMap(true);
 
-    // 3. 终极去重锁 + 同名对称关系合并（如 朋友<->朋友、同门<->同门 合并为单根双向箭头）
+    const fullTimeEdgeMap = computeResolvedEdgeMap(false);
+    const matrixMap: Record<string, RawRelationEdge[]> = {};
+    Object.values(fullTimeEdgeMap).forEach((edge) => {
+      const cellKey = `${edge.targetId}__${edge.sourceId}`;
+      if (!matrixMap[cellKey]) matrixMap[cellKey] = [];
+      const exists = matrixMap[cellKey]!.some((e) => e.label === edge.label && e.timeStr === edge.timeStr);
+      if (!exists) {
+        matrixMap[cellKey]!.push(edge);
+      }
+    });
+
+    let activeNodes: NodeData[] = baseCharacters.map((n) => ({ ...n }));
+
     const dedupedLinks: LinkData[] = [];
     const consumedKeys = new Set<string>();
     const exactDirLabelSeen = new Set<string>();
@@ -1735,25 +1937,19 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
 
     let activeLinks = dedupedLinks;
 
-// 4. 搜索过滤（同时支持搜索“人物名称”与“关系名称”）
     if (searchQuery.trim()) {
       const q = searchQuery.trim().toLowerCase();
-      // (a) 匹配人物节点
       const matchedNodeIds = new Set(activeNodes.filter((n) => n.label.toLowerCase().includes(q)).map((n) => n.id));
-      // (b) 匹配关系连线文字，并收集命中连线所属的语义组 pairGroupId（确保成组的配对关系如“父亲+儿子”、“妻子+丈夫”一并保留！）
       const matchedPairGroupIds = new Set(
         activeLinks.filter((l) => l.label.toLowerCase().includes(q)).map((l) => l.pairGroupId)
       );
 
       activeLinks = activeLinks.filter((l) => {
-        // 若连线本身或其成组的配对关系命中搜索词，保留该组连线
         if (matchedPairGroupIds.has(l.pairGroupId)) return true;
-        // 若连线两端有节点命中了人物搜索，保留该人物的关联连线
         if (matchedNodeIds.has(l.sourceId) || matchedNodeIds.has(l.targetId)) return true;
         return false;
       });
 
-      // 仅展示命中人物节点以及上述保留连线两端的相关节点
       const visibleNodeIds = new Set<string>(matchedNodeIds);
       activeLinks.forEach((l) => {
         visibleNodeIds.add(l.sourceId);
@@ -1763,7 +1959,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       activeNodes = activeNodes.filter((n) => visibleNodeIds.has(n.id));
     }
 
-    // 5. 孤立节点过滤
     const connectedIds = new Set<string>();
     activeLinks.forEach((l) => {
       connectedIds.add(l.sourceId);
@@ -1778,10 +1973,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       activeLinks = activeLinks.filter((l) => allowed.has(l.sourceId) && allowed.has(l.targetId));
     }
 
-    // ---------------- 6. 均匀流式槽位（Uniform Slot）平行线与文字排版算法 ----------------
-    // 彻底解决“间距有的超级大、有的超级小”以及多线文字重叠问题：
-    //   - 同一语义对内部（如 妻子+丈夫）两条线间距为 INTRA_GAP (10px)，紧凑成对；
-    //   - 相邻不同语义组之间的【边缘间距】固定为均匀的 INTER_GAP (16px)，绝不再按中心跳 24px 导致间距忽大忽小！
     const nodePairBuckets: Record<string, LinkData[]> = {};
     activeLinks.forEach((l) => {
       const pairKey = [l.sourceId, l.targetId].sort().join('<->');
@@ -1789,19 +1980,19 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       nodePairBuckets[pairKey].push(l);
     });
 
-    const INTRA_GAP = 10; // 同组配对双线之间的间距
-    const INTER_GAP = 16; // 不同关系组之间的边缘间距
+    const INTRA_GAP = 10;
+    const INTER_GAP = 16;
 
     Object.values(nodePairBuckets).forEach((bucket) => {
-      if (bucket.length === 0) return; // 提前防御空数组
-      const firstBucket = bucket[0]!;  // 强制断言一定存在
+      if (bucket.length === 0) return;
+      const firstBucket = bucket[0]!;
       const totalEdges = bucket.length;
       const [minId] = [firstBucket.sourceId, firstBucket.targetId].sort();
 
       const groupMap: Record<string, LinkData[]> = {};
       bucket.forEach((l) => {
         if (!groupMap[l.pairGroupId]) groupMap[l.pairGroupId] = [];
-        groupMap[l.pairGroupId]!.push(l); // 强制断言
+        groupMap[l.pairGroupId]!.push(l);
       });
 
       const semanticGroups = Object.keys(groupMap)
@@ -1817,7 +2008,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       if (!firstGroup) return;
 
       if (groupCount === 1 && firstGroup.length === 1) {
-        const l = firstGroup[0]!; // 强制断言
+        const l = firstGroup[0]!;
         l.totalBetweenNodes = 1;
         l.isExactlyTwoOpposite = false;
         l.canonOffsetPx = 0;
@@ -1827,8 +2018,8 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       }
 
       if (groupCount === 1 && firstGroup.length === 2) {
-        const line1 = firstGroup[0]!; // 强制断言第一条线存在
-        const line2 = firstGroup[1]!; // 强制断言第二条线存在
+        const line1 = firstGroup[0]!;
+        const line2 = firstGroup[1]!;
         if (line1.sourceId !== line2.sourceId) {
           firstGroup.forEach((l) => {
             l.totalBetweenNodes = 2;
@@ -1842,7 +2033,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
         }
       }
 
-      // 计算所有线在统一基准法向轴上的相对位置，保证组内间距 INTRA_GAP，组间边缘间距 INTER_GAP
       const rawOffsets: number[] = [];
       let cursor = 0;
       semanticGroups.forEach((grp, gIdx) => {
@@ -1853,19 +2043,17 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
         });
       });
 
-      // 整体居中对称化
       const midSpan = cursor / 2;
       const centeredOffsets = rawOffsets.map((pos) => pos - midSpan);
 
       let flatIdx = 0;
       semanticGroups.forEach((grp) => {
         grp.forEach((l, innerIdx) => {
-          const lineOffset = centeredOffsets[flatIdx] || 0; // 给一个默认值 0
+          const lineOffset = centeredOffsets[flatIdx] || 0;
           l.totalBetweenNodes = totalEdges;
           l.isExactlyTwoOpposite = false;
           l.canonOffsetPx = lineOffset;
 
-          // 文字偏移：若在同组配对内部，第一条线文字偏左外侧 (-10px)，第二条线文字偏右外侧 (+10px)；单条线偏外侧
           let labelShift = 10;
           if (grp.length >= 2) {
             labelShift = innerIdx === 0 ? -10 : 10;
@@ -1874,14 +2062,18 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
           }
           l.canonLabelOffsetPx = lineOffset + labelShift;
 
-          // 沿线方向阶梯错开，彻底避免多条平行线的文字挤在同一垂直切面上
           l.canonAlongOffsetPx = (flatIdx - (totalEdges - 1) / 2) * 22;
           flatIdx++;
         });
       });
     });
 
-    return { nodes: activeNodes, links: activeLinks };
+    return {
+      nodes: activeNodes,
+      links: activeLinks,
+      allCharacterNodes: baseCharacters,
+      fullTimeMatrixMap: matrixMap,
+    };
   }, [
     rawFiles,
     baseResolvedEdges,
@@ -1893,13 +2085,12 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     inferDisplayMode,
   ]);
 
-  // ---------------- 独立几何坐标更新函数（修复箭头顶部刺出线条 & 解决对角线交叉文字碰撞） ----------------
+  // ---------------- 独立几何坐标更新函数 ----------------
   const updateGraphPositions = useCallback(() => {
     if (!containerRef.current) return;
     const container = d3.select(containerRef.current);
     const { nodeSize: r, showArrow: arrowOn, linkThickness: thickness } = styleParamsRef.current;
 
-    // 箭头总长度随粗细动态计算（与 applyVisualStyles 中的 markerWidth 完全一致）
     const fullArrowLen = Math.max(7, 5 + thickness * 2.8);
     const halfArrowLen = Math.max(8, 6 + thickness * 3.0);
 
@@ -1931,8 +2122,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       const absOffset = Math.min(Math.abs(d.canonOffsetPx), r - 1);
       const radialEdge = Math.sqrt(Math.max(4, r * r - absOffset * absOffset));
 
-      // 关键修复：线条终点停在【节点圆周 + 箭头完整长度】处（而 marker 的 refX 设为底座 0），
-      // 这样粗线条恰好连接到箭头底座，100% 绝不会从箭头尖端刺出！
       const isHalf = d.isExactlyTwoOpposite && d.totalBetweenNodes === 2;
       const curArrowLen = isHalf ? halfArrowLen : fullArrowLen;
 
@@ -1959,7 +2148,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       geomMap[d.id] = { x1, y1, x2, y2, mx, my, cUx, cUy, len, label: d.label };
     });
 
-    // 全局连线文字防碰撞检测
     const geomEntries = Object.values(geomMap);
     for (let pass = 0; pass < 3; pass++) {
       for (let i = 0; i < geomEntries.length; i++) {
@@ -1967,7 +2155,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
           const g1 = geomEntries[i]!;
           const g2 = geomEntries[j]!;
           const w1 = Math.max(26, g1.label.length * 12);
-          const w2 = Math.max(26, g2.label.length * 12); // 补上缺失的 w2 定义
+          const w2 = Math.max(26, g2.label.length * 12);
           const minDx = (w1 + w2) / 2 + 4;
           const minDy = 15;
 
@@ -1975,7 +2163,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
           const distY = Math.abs(g1.my - g2.my);
 
           if (distX < minDx && distY < minDy) {
-            // 发生碰撞：将两条线的文字分别沿着各自连线方向一前一后推开 18px
             const push = 18;
             g1.mx -= g1.cUx * push;
             g1.my -= g1.cUy * push;
@@ -2022,7 +2209,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       });
   }, []);
 
-  // 独立视觉样式渲染函数（显著放大粗线条下的箭头翼展与长度，彻底解决“变粗后箭头不明显”）
+  // 独立视觉样式渲染函数
   const applyVisualStyles = useCallback(() => {
     if (!containerRef.current || !svgRef.current) return;
     const container = d3.select(containerRef.current);
@@ -2044,7 +2231,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     const currentLinks = simLinksRef.current;
     const conflictColor = '#e03131';
 
-    // 关键升级：大幅提升箭头随连线粗细 (thickness) 的缩放系数，保证粗线下的箭头棱角分明、极其明显！
     const fullArrowLen = Math.max(7, 5 + thickness * 2.8);
     const fullArrowWing = Math.max(6.5, 4.8 + thickness * 2.6);
     const halfArrowLen = Math.max(8, 6 + thickness * 3.0);
@@ -2168,7 +2354,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     svg.select('#half-arrow-conflict path').attr('fill', conflictColor);
   }, []);
 
-  // 初始化 D3 Simulation（将所有箭头的 refX 定在底座，彻底根治“箭头顶部有线超出”）
+  // 初始化 D3 Simulation
   useEffect(() => {
     if (!svgRef.current || !containerRef.current) return;
     const svg = d3.select(svgRef.current);
@@ -2179,7 +2365,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     svg.selectAll('defs').remove();
     const defs = svg.append('defs');
 
-    // 1. 终点完整三角形箭头：refX="0.5" 定在箭头左端底座！线条只画到箭头底座即停止，绝不可能刺穿箭头尖端 (x=10)！
     ['full-arrow', 'full-arrow-active', 'full-arrow-conflict'].forEach((id) => {
       defs
         .append('marker')
@@ -2195,7 +2380,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
         .attr('d', 'M0,-4.5 L10,0 L0,4.5 Z');
     });
 
-    // 2. 起点反向完整三角形箭头：refX="9.5" 定在右侧底座，尖端朝左指向 x=0，同样绝不刺穿！
     ['full-arrow-start', 'full-arrow-start-active', 'full-arrow-start-conflict'].forEach((id) => {
       defs
         .append('marker')
@@ -2211,7 +2395,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
         .attr('d', 'M10,-4.5 L0,0 L10,4.5 Z');
     });
 
-    // 3. 外侧半边三角形箭头（专用于 2 根不同称谓的平行双线 ⇌）：refX="0.5" 定在底座，尖角在 x=10，外翼展 y=-5
     ['half-arrow', 'half-arrow-active', 'half-arrow-conflict'].forEach((id) => {
       defs
         .append('marker')
@@ -2285,7 +2468,11 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       if (prev && prev.x !== undefined && prev.y !== undefined) {
         prev.label = n.label;
         prev.realName = n.realName;
+        prev.path = n.path;
         prev.gender = n.gender;
+        prev.aliases = n.aliases;
+        prev.ctime = n.ctime;
+        prev.mtime = n.mtime;
         prev.isIsolated = n.isIsolated;
         return prev;
       }
@@ -2312,8 +2499,8 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       .filter((l) => nodeLookup[l.sourceId] && nodeLookup[l.targetId])
       .map((l) => ({
         ...l,
-        source: nodeLookup[l.sourceId] as string | NodeData, // 强制断言
-        target: nodeLookup[l.targetId] as string | NodeData, // 强制断言
+        source: nodeLookup[l.sourceId] as string | NodeData,
+        target: nodeLookup[l.targetId] as string | NodeData,
       }));
 
     simNodesRef.current = nextNodes;
@@ -2355,17 +2542,19 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
         if (!d.conflictReason) return;
         const srcLabel = (d.source as NodeData).label || d.sourceId;
         const tgtLabel = (d.target as NodeData).label || d.targetId;
+        const pos = getRelativeMousePos(event.clientX, event.clientY);
         setConflictTooltip({
           visible: true,
-          x: event.clientX,
-          y: event.clientY,
+          x: pos.x,
+          y: pos.y,
           title: `⚠️ 关系冲突：${srcLabel} → ${tgtLabel} (${d.label})`,
           reason: d.conflictReason,
         });
       })
       .on('mousemove', (event: MouseEvent, d) => {
         if (!d.conflictReason) return;
-        setConflictTooltip((prev) => (prev.visible ? { ...prev, x: event.clientX, y: event.clientY } : prev));
+        const pos = getRelativeMousePos(event.clientX, event.clientY);
+        setConflictTooltip((prev) => (prev.visible ? { ...prev, x: pos.x, y: pos.y } : prev));
       })
       .on('mouseleave', () => {
         setConflictTooltip((prev) => (prev.visible ? { ...prev, visible: false } : prev));
@@ -2442,7 +2631,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     applyVisualStyles();
 
     sim.alpha(0.08).restart();
-  }, [nodes, links, plugin, updateGraphPositions, applyVisualStyles]);
+  }, [nodes, links, plugin, updateGraphPositions, applyVisualStyles, getRelativeMousePos]);
 
   useEffect(() => {
     const sim = simulationRef.current;
@@ -2571,7 +2760,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
           if (mPx >= -80 && mPx <= timelineWidth + 80) {
             primaryTicks.push({ pos: mPx, label: `${formatYearZh(y, true)} ${MONTH_NAMES_ZH[m]}` });
           }
-          const daysInM = MONTH_DAYS[m] || 30; // 这里的非空断言
+          const daysInM = MONTH_DAYS[m] || 30;
           for (let d = 1; d <= daysInM; d += dayStep) {
             if (dayStep === 7 && d > 25) continue;
             const dVal = y + (accDays + d - 1) / 365;
@@ -2657,23 +2846,220 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     return `${yStr}${ymd.month}月${ymd.day}日`;
   };
 
-  return (
-    <div style={{ position: 'relative', width: '100%', height: '100%', background: 'transparent', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-      <div style={{ position: 'relative', flex: 1, width: '100%', overflow: 'hidden' }}>
-        {nodes.length === 0 && (
-          <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', color: 'var(--text-muted)', textAlign: 'center', pointerEvents: 'none' }}>
-            当前时间或筛选条件下暂无人物节点。<br />
-            请检查文件夹路径配置或调整底部时间轴。
-          </div>
-        )}
+  const getNodeColor = useCallback(
+    (label: string) => {
+      const matched = colorGroups.find((g) => g.keyword.trim() !== '' && label.includes(g.keyword.trim()));
+      return matched ? matched.color : 'var(--text-muted)';
+    },
+    [colorGroups]
+  );
 
-        {/* 红色冲突连线悬浮 Tooltip 层 */}
+  const renderHighlightedText = (text: string, query: string) => {
+    const q = query.trim();
+    if (!q) return text;
+    const lowerText = text.toLowerCase();
+    const lowerQ = q.toLowerCase();
+    const idx = lowerText.indexOf(lowerQ);
+    if (idx === -1) return text;
+    const before = text.slice(0, idx);
+    const match = text.slice(idx, idx + q.length);
+    const after = text.slice(idx + q.length);
+    return (
+      <>
+        {before}
+        <mark
+          style={{
+            background: 'rgba(255, 208, 0, 0.42)',
+            color: 'inherit',
+            padding: '0 2px',
+            borderRadius: '2px',
+            fontWeight: 700,
+          }}
+        >
+          {match}
+        </mark>
+        {after}
+      </>
+    );
+  };
+
+  // ---------------- 核心排序引擎：统一对全量人物进行排序（最左列与最顶行 100% 同步） ----------------
+  const sortedCharacterNodes = useMemo(() => {
+    const list = [...allCharacterNodes];
+    const collator = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });
+
+    if (listSortMode === 'name-asc') {
+      return list.sort((a, b) => collator.compare(a.label, b.label));
+    }
+    if (listSortMode === 'name-desc') {
+      return list.sort((a, b) => collator.compare(b.label, a.label));
+    }
+    if (listSortMode === 'mtime-desc') {
+      return list.sort((a, b) => b.mtime - a.mtime || collator.compare(a.label, b.label));
+    }
+    if (listSortMode === 'mtime-asc') {
+      return list.sort((a, b) => a.mtime - b.mtime || collator.compare(a.label, b.label));
+    }
+    if (listSortMode === 'ctime-desc') {
+      return list.sort((a, b) => b.ctime - a.ctime || collator.compare(a.label, b.label));
+    }
+    if (listSortMode === 'ctime-asc') {
+      return list.sort((a, b) => a.ctime - b.ctime || collator.compare(a.label, b.label));
+    }
+
+    // 手动拖拽排序（自定义顺序）：严格读取持久化的 customManualOrder，切回时 100% 还原上次手动排序
+    if (listSortMode === 'manual') {
+      if (customManualOrder.length === 0) {
+        return list.sort((a, b) => collator.compare(a.label, b.label));
+      }
+      const rankMap = new Map<string, number>();
+      customManualOrder.forEach((id, idx) => rankMap.set(id, idx));
+      return list.sort((a, b) => {
+        const ra = rankMap.has(a.id) ? rankMap.get(a.id)! : 999999;
+        const rb = rankMap.has(b.id) ? rankMap.get(b.id)! : 999999;
+        if (ra !== rb) return ra - rb;
+        return collator.compare(a.label, b.label);
+      });
+    }
+
+    // 与文件管理器一致（穿透支持 Flexplorer + 原生排序规则回退）
+    if (explorerOrderTokens.length > 0) {
+      const getTokenRank = (node: NodeData): number => {
+        const candidates = [node.path, `${node.id}.md`, node.id, node.label];
+        let best = 999999;
+        for (let i = 0; i < explorerOrderTokens.length; i++) {
+          const tk = explorerOrderTokens[i]!;
+          if (
+            candidates.includes(tk) ||
+            tk.endsWith(`/${node.id}.md`) ||
+            tk.endsWith(`/${node.id}`)
+          ) {
+            if (i < best) best = i;
+          }
+        }
+        return best;
+      };
+
+      const hasAnyMatch = list.some((n) => getTokenRank(n) < 999999);
+      if (hasAnyMatch) {
+        return list.sort((a, b) => {
+          const ra = getTokenRank(a);
+          const rb = getTokenRank(b);
+          if (ra !== rb) return ra - rb;
+          return collator.compare(a.realName, b.realName);
+        });
+      }
+    }
+
+    // 若未配置 Flexplorer 顺序，则按 Obsidian 原生文件管理器排序规则排列
+    if (nativeSortRule === 'alphabeticalReverse') {
+      return list.sort((a, b) => collator.compare(b.realName, a.realName));
+    }
+    if (nativeSortRule === 'byModifiedTime') {
+      return list.sort((a, b) => b.mtime - a.mtime);
+    }
+    if (nativeSortRule === 'byModifiedTimeReverse') {
+      return list.sort((a, b) => a.mtime - b.mtime);
+    }
+    if (nativeSortRule === 'byCreatedTime') {
+      return list.sort((a, b) => b.ctime - a.ctime);
+    }
+    if (nativeSortRule === 'byCreatedTimeReverse') {
+      return list.sort((a, b) => a.ctime - b.ctime);
+    }
+    return list.sort((a, b) => collator.compare(a.realName, b.realName));
+  }, [allCharacterNodes, listSortMode, customManualOrder, explorerOrderTokens, nativeSortRule]);
+
+  // 列表视图左侧行筛选：基于排好序的 sortedCharacterNodes 过滤左侧行，顶部列始终保持完整排好序的 sortedCharacterNodes
+  const filteredListRows = useMemo(() => {
+    const q = listSearchQuery.trim().toLowerCase();
+    if (!q) return sortedCharacterNodes;
+
+    return sortedCharacterNodes.filter((rowNode) => {
+      const matchChar =
+        rowNode.label.toLowerCase().includes(q) ||
+        rowNode.aliases.some((a) => a.toLowerCase().includes(q));
+
+      let matchRel = false;
+      for (const colNode of sortedCharacterNodes) {
+        if (colNode.id === rowNode.id) continue;
+        const cellEdges = fullTimeMatrixMap[`${rowNode.id}__${colNode.id}`] || [];
+        if (cellEdges.some((e) => e.label.toLowerCase().includes(q))) {
+          matchRel = true;
+          break;
+        }
+      }
+
+      if (listSearchScope === 'character') return matchChar;
+      if (listSearchScope === 'relation') return matchRel;
+      return matchChar || matchRel;
+    });
+  }, [sortedCharacterNodes, fullTimeMatrixMap, listSearchQuery, listSearchScope]);
+
+  // 处理左侧人物拖拽排序完成：更新 customManualOrder，自动切换到 'manual' 模式，并同步刷新顶部行与左侧列
+  const handleRowDrop = useCallback(
+    (targetRowId: string) => {
+      if (!draggedRowId || draggedRowId === targetRowId) {
+        setDraggedRowId(null);
+        setDragOverRowId(null);
+        return;
+      }
+
+      const baseOrder = sortedCharacterNodes.map((n) => n.id);
+      const fromIdx = baseOrder.indexOf(draggedRowId);
+      const toIdx = baseOrder.indexOf(targetRowId);
+
+      if (fromIdx !== -1 && toIdx !== -1) {
+        setIsSortingList(true); 
+        
+        requestAnimationFrame(() => {
+          setTimeout(() => {
+            const nextOrder = [...baseOrder];
+            const [moved] = nextOrder.splice(fromIdx, 1);
+            if (moved) {
+              nextOrder.splice(toIdx, 0, moved);
+            }
+            
+            if (listSortMode !== 'manual') {
+               setListSortMode('manual');
+            }
+            setCustomManualOrder(nextOrder);
+            
+            setIsSortingList(false);
+          }, 10); 
+        });
+      }
+
+      setDraggedRowId(null);
+      setDragOverRowId(null);
+    },
+    [draggedRowId, sortedCharacterNodes, listSortMode]
+  );
+
+  const highlightCharInList = listSearchQuery.trim() !== '' && (listSearchScope === 'all' || listSearchScope === 'character');
+  const highlightRelInList = listSearchQuery.trim() !== '' && (listSearchScope === 'all' || listSearchScope === 'relation');
+
+  // 100% 不透明实色背景定义（彻底解决 sticky 固定列与固定表头在滚动时半透明高亮块穿模重叠的问题）
+  const solidHeaderBg = 'var(--background-secondary)';
+  const solidHeaderHighlightBg = 'color-mix(in srgb, var(--interactive-accent) 16%, var(--background-secondary))';
+  const solidRowBg = 'var(--background-primary)';
+  const solidRowHighlightBg = 'color-mix(in srgb, var(--interactive-accent) 16%, var(--background-primary))';
+  const solidCrosshairCellBg = 'color-mix(in srgb, var(--interactive-accent) 10%, var(--background-primary))';
+  const solidSelectedCellBg = 'color-mix(in srgb, var(--interactive-accent) 20%, var(--background-primary))';
+
+  return (
+    <div
+      ref={workspaceRootRef}
+      style={{ position: 'relative', width: '100%', height: '100%', background: 'transparent', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}
+    >
+      <div style={{ position: 'relative', flex: 1, width: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+        {/* 红色冲突连线悬浮 Tooltip 层（基于 workspaceRootRef 精准相对定位，紧贴鼠标） */}
         {conflictTooltip.visible && (
           <div
             style={{
-              position: 'fixed',
-              left: conflictTooltip.x + 14,
-              top: conflictTooltip.y + 14,
+              position: 'absolute',
+              left: conflictTooltip.x,
+              top: conflictTooltip.y,
               maxWidth: '300px',
               padding: '10px 12px',
               background: 'var(--background-primary)',
@@ -2694,573 +3080,1446 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
           </div>
         )}
 
-        {/* 顶部居中：大模型异步分析进程浮窗 */}
-        {llmLoading && (
+        {/* 列表视图：关闭时间显示时的悬停时间范围 Tooltip（基于 workspaceRootRef 精准相对定位，紧贴鼠标） */}
+        {timeTooltip.visible && (
           <div
             style={{
               position: 'absolute',
-              top: 16,
-              left: '50%',
-              transform: 'translateX(-50%)',
-              padding: '7px 16px',
-              background: 'var(--background-secondary)',
-              border: '1px solid var(--interactive-accent)',
-              borderRadius: '20px',
-              boxShadow: '0 4px 16px rgba(0,0,0,0.2)',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '8px',
-              fontSize: '12px',
-              color: 'var(--text-normal)',
-              zIndex: 25,
-            }}
-          >
-            <RefreshCw size={14} color="var(--interactive-accent)" />
-            <span>{llmStepText || '大模型正在补全全局关系...'}</span>
-          </div>
-        )}
-
-        {/* 左上角：AI 重新推演按钮 & 仅在点击锁定时展示的“当前焦点” */}
-        <div style={{ position: 'absolute', top: 16, left: 16, display: 'flex', alignItems: 'center', gap: '8px', zIndex: 10 }}>
-          <button
-            onClick={() => runLlmAnalysis(currentFingerprint, true)}
-            disabled={llmLoading}
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '5px',
+              left: timeTooltip.x,
+              top: timeTooltip.y,
               padding: '5px 10px',
               background: 'var(--background-primary)',
               border: '1px solid var(--background-modifier-border)',
               borderRadius: '6px',
-              fontSize: '12px',
-              color: 'var(--text-muted)',
-              cursor: llmLoading ? 'wait' : 'pointer',
+              boxShadow: '0 4px 14px rgba(0,0,0,0.18)',
+              zIndex: 9998,
+              pointerEvents: 'none',
+              fontSize: '11px',
+              color: 'var(--text-normal)',
+              whiteSpace: 'nowrap',
             }}
-            title="将全量人物交给大模型做全局知识图谱补全与冲突检测"
           >
-            <Sparkles color="var(--interactive-accent)" size={13} />
-            <span>{llmLoading ? '推演中...' : 'AI 重新推演关系'}</span>
-          </button>
+            🕒 时间范围：<span style={{ color: 'var(--interactive-accent)', fontWeight: 600 }}>{timeTooltip.text}</span>
+          </div>
+        )}
 
-          {selectedNodeId && (
+        {/* 顶部居中：视图切换按钮（图谱 / 列表） */}
+        <div
+          style={{
+            position: 'absolute',
+            top: 12,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 30,
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: '8px',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '4px',
+              padding: '3px',
+              background: 'rgba(255, 255, 255, 0.1)', // 半透明背景底色
+              backdropFilter: 'blur(12px)', // 毛玻璃模糊效果
+              WebkitBackdropFilter: 'blur(12px)', // 兼容 Safari
+              border: '1px solid rgba(255, 255, 255, 0.7)', // 微妙的半透明边框
+              borderRadius: '20px', // 更圆润的整体外框
+              boxShadow: '0 4px 12px rgba(0, 0, 0, 0.03), inset 0 1px 0 rgba(255, 255, 255, 0.2)', // 增加内发光和外阴影增加立体感
+            }}
+          >
+            <button
+              onClick={() => setViewMode('graph')}
+              style={{
+                padding: '4px 20px',
+                fontSize: '12px',
+                fontWeight: viewMode === 'graph' ? 600 : 500,
+                borderRadius: '16px', // 内部按钮也更圆润
+                border: 'none',
+                cursor: 'pointer',
+                // 选中时使用带有透明度的强调色并带有微小阴影，未选中完全透明
+                background: viewMode === 'graph' ? 'color-mix(in srgb, var(--interactive-accent) 90%, transparent)' : 'transparent',
+                color: viewMode === 'graph' ? 'var(--text-on-accent)' : 'var(--text-muted)',
+                boxShadow: viewMode === 'graph' ? '0 2px 6px rgba(0,0,0,0.15)' : 'none',
+                transition: 'all 0.2s cubic-bezier(0.25, 0.1, 0.25, 1)', // 更平滑的过渡
+              }}
+            >
+              图谱
+            </button>
+            <button
+              onClick={() => setViewMode('list')}
+              style={{
+                padding: '4px 20px',
+                fontSize: '12px',
+                fontWeight: viewMode === 'list' ? 600 : 500,
+                borderRadius: '16px',
+                border: 'none',
+                cursor: 'pointer',
+                background: viewMode === 'list' ? 'color-mix(in srgb, var(--interactive-accent) 90%, transparent)' : 'transparent',
+                color: viewMode === 'list' ? 'var(--text-on-accent)' : 'var(--text-muted)',
+                boxShadow: viewMode === 'list' ? '0 2px 6px rgba(0,0,0,0.15)' : 'none',
+                transition: 'all 0.2s cubic-bezier(0.25, 0.1, 0.25, 1)',
+              }}
+            >
+              列表
+            </button>
+          </div>
+
+          {llmLoading && (
             <div
               style={{
-                padding: '5px 12px',
+                padding: '5px 14px',
                 background: 'var(--background-secondary)',
-                border: '1px solid var(--background-modifier-border)',
-                borderRadius: '6px',
-                fontSize: '12px',
-                color: 'var(--text-normal)',
+                border: '1px solid var(--interactive-accent)',
+                borderRadius: '20px',
+                boxShadow: '0 4px 16px rgba(0,0,0,0.2)',
                 display: 'flex',
                 alignItems: 'center',
                 gap: '8px',
+                fontSize: '12px',
+                color: 'var(--text-normal)',
+                whiteSpace: 'nowrap',
               }}
             >
-              <span>
-                当前焦点: <strong style={{ color: 'var(--interactive-accent)' }}>{nodes.find((n) => n.id === selectedNodeId)?.label || selectedNodeId}</strong>
-              </span>
-              <span style={{ color: 'var(--text-muted)', cursor: 'pointer' }} onClick={() => setSelectedNodeId(null)}>
-                (点击取消锁定)
-              </span>
+              <RefreshCw size={13} color="var(--interactive-accent)" />
+              <span>{llmStepText || '大模型正在补全全局关系...'}</span>
             </div>
           )}
         </div>
 
-        <svg ref={svgRef} style={{ width: '100%', height: '100%', display: 'block', cursor: 'grab' }}>
-          <g ref={containerRef}></g>
-        </svg>
+        {/* 左上角：仅在图谱模式下显示 AI 重新推演按钮 & 当前焦点 */}
+        {viewMode === 'graph' && (
+          <div style={{ position: 'absolute', top: 16, left: 16, display: 'flex', alignItems: 'center', gap: '8px', zIndex: 10 }}>
+            <button
+              onClick={() => runLlmAnalysis(currentFingerprint, true)}
+              disabled={llmLoading}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '5px',
+                padding: '5px 10px',
+                background: 'var(--background-primary)',
+                border: '1px solid var(--background-modifier-border)',
+                borderRadius: '6px',
+                fontSize: '12px',
+                color: 'var(--text-muted)',
+                cursor: llmLoading ? 'wait' : 'pointer',
+              }}
+              title="将全量人物交给大模型做全局知识图谱补全与冲突检测"
+            >
+              <Sparkles color="var(--interactive-accent)" size={13} />
+              <span>{llmLoading ? '推演中...' : 'AI 重新推演关系'}</span>
+            </button>
 
+            {selectedNodeId && (
+              <div
+                style={{
+                  padding: '5px 12px',
+                  background: 'var(--background-secondary)',
+                  border: '1px solid var(--background-modifier-border)',
+                  borderRadius: '6px',
+                  fontSize: '12px',
+                  color: 'var(--text-normal)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                }}
+              >
+                <span>
+                  当前焦点: <strong style={{ color: 'var(--interactive-accent)' }}>{nodes.find((n) => n.id === selectedNodeId)?.label || selectedNodeId}</strong>
+                </span>
+                <span style={{ color: 'var(--text-muted)', cursor: 'pointer' }} onClick={() => setSelectedNodeId(null)}>
+                  (点击取消锁定)
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* 图谱主画布 */}
+        <div
+          style={{
+            position: 'relative',
+            flex: 1,
+            width: '100%',
+            height: '100%',
+            display: viewMode === 'graph' ? 'block' : 'none',
+          }}
+        >
+          {nodes.length === 0 && (
+            <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', color: 'var(--text-muted)', textAlign: 'center', pointerEvents: 'none' }}>
+              当前时间或筛选条件下暂无人物节点。<br />
+              请检查文件夹路径配置或调整底部时间轴。
+            </div>
+          )}
+          <svg ref={svgRef} style={{ width: '100%', height: '100%', display: 'block', cursor: 'grab' }}>
+            <g ref={containerRef}></g>
+          </svg>
+        </div>
+
+        {/* 列表主视图（关系矩阵表） */}
+        {viewMode === 'list' && (
+          <div
+            onClick={() => {
+              setSelectedListRowId(null);
+              setSelectedListCell(null);
+            }}
+            style={{
+              position: 'relative',
+              flex: 1,
+              width: '100%',
+              height: '100%',
+              paddingTop: '56px',
+              paddingLeft: '16px',
+              paddingRight: '16px',
+              paddingBottom: '16px',
+              boxSizing: 'border-box',
+              display: 'flex',
+              flexDirection: 'column',
+              overflow: 'hidden',
+            }}
+          >
+            {/* 排序切换与拖拽重排 Loading 遮罩提示 */}
+            {isSortingList && (
+              <div
+                style={{
+                  position: 'absolute',
+                  inset: '56px 16px 16px 16px',
+                  background: 'rgba(0, 0, 0, 0.12)',
+                  backdropFilter: 'blur(1.5px)',
+                  zIndex: 50,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  borderRadius: '8px',
+                  pointerEvents: 'none',
+                }}
+              >
+                <div
+                  style={{
+                    padding: '8px 16px',
+                    background: 'var(--background-primary)',
+                    border: '1px solid var(--interactive-accent)',
+                    borderRadius: '20px',
+                    boxShadow: '0 4px 16px rgba(0,0,0,0.2)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    fontSize: '12px',
+                    fontWeight: 600,
+                    color: 'var(--text-normal)',
+                  }}
+                >
+                  <RefreshCw size={14} color="var(--interactive-accent)" />
+                  <span>正在同步行列排序...</span>
+                </div>
+              </div>
+            )}
+
+            {sortedCharacterNodes.length === 0 ? (
+              <div style={{ margin: 'auto', color: 'var(--text-muted)', textAlign: 'center', fontSize: '13px' }}>
+                暂无人物数据，请检查插件设置中的目标文件夹与属性配置。
+              </div>
+            ) : (
+              <div
+                style={{
+                  flex: 1,
+                  width: '100%',
+                  height: '100%',
+                  overflow: 'auto',
+                  border: '1px solid var(--background-modifier-border)',
+                  borderRadius: '8px',
+                  background: 'var(--background-primary)',
+                  boxShadow: '0 4px 20px rgba(0, 0, 0, 0.06)',
+                }}
+              >
+                <table
+                  style={{
+                    borderCollapse: 'separate',
+                    borderSpacing: 0,
+                    width: 'max-content',
+                    minWidth: '100%',
+                    fontSize: '12px',
+                    userSelect: 'none',
+                  }}
+                >
+                  <thead>
+                    <tr>
+                      {/* 左上角固定交叉表头（Z-index 最高，纯实色背景防穿透） */}
+                      <th
+                        style={{
+                          position: 'sticky',
+                          top: 0,
+                          left: 0,
+                          zIndex: 12,
+                          width: '196px',
+                          minWidth: '196px',
+                          maxWidth: '196px',
+                          minHeight: '46px', // 修改点：取消固定 height，允许被右侧撑高
+                          padding: '8px 12px',
+                          boxSizing: 'border-box',
+                          background: solidHeaderBg,
+                          borderRight: '1px solid var(--background-modifier-border)',
+                          borderBottom: '1px solid var(--background-modifier-border)',
+                          boxShadow: '2px 2px 5px rgba(0, 0, 0, 0.04)',
+                          textAlign: 'left',
+                          fontWeight: 600,
+                          color: 'var(--text-muted)',
+                          fontSize: '11px',
+                        }}
+                      >
+                        人物 \ 对象
+                      </th>
+
+                      {/* 最顶部一行：名字完整展示，别名紧跟其后。溢出截断（最多4行） */}
+                      {sortedCharacterNodes.map((colNode) => {
+                        const isColHighlighted = selectedListCell?.colId === colNode.id;
+                        const firstAlias = colNode.aliases[0] || '';
+                        const fullTitle = firstAlias
+                          ? `${colNode.label} (${firstAlias})\n按住 Command/Ctrl 单击打开笔记`
+                          : `${colNode.label}\n按住 Command/Ctrl 单击打开笔记`;
+
+                        return (
+                          <th
+                            key={`col-${colNode.id}`}
+                            onClick={(e) => {
+                              if (e.metaKey || e.ctrlKey) {
+                                e.stopPropagation();
+                                plugin?.app?.workspace?.openLinkText(colNode.realName, '', true);
+                              }
+                            }}
+                            style={{
+                              position: 'sticky',
+                              top: 0,
+                              zIndex: 8,
+                              width: '144px',
+                              minWidth: '144px',
+                              maxWidth: '144px',
+                              minHeight: '46px', // 修改点：取消固定 height，文字换行时自动撑高
+                              padding: '6px 10px',
+                              boxSizing: 'border-box',
+                              background: isColHighlighted ? solidHeaderHighlightBg : solidHeaderBg,
+                              borderRight: '1px solid var(--background-modifier-border)',
+                              borderBottom: isColHighlighted
+                                ? '2px solid var(--interactive-accent)'
+                                : '1px solid var(--background-modifier-border)',
+                              textAlign: 'center',
+                              verticalAlign: 'middle',
+                            }}
+                            title={fullTitle}
+                          >
+                            {/* 外层容器负责居中对齐 */}
+                            <div
+                              style={{
+                                display: 'flex',
+                                justifyContent: 'center',
+                                width: '100%',
+                              }}
+                            >
+                              {/* 内层容器负责多行左对齐和截断 */}
+                              <div
+                                style={{
+                                  display: '-webkit-box',
+                                  WebkitBoxOrient: 'vertical',
+                                  WebkitLineClamp: 4,
+                                  overflow: 'hidden',
+                                  wordBreak: 'break-all',
+                                  whiteSpace: 'normal',
+                                  lineHeight: 1.3,
+                                  color: 'var(--text-muted)',
+                                  textAlign: 'left', // 强制左对齐，单行时受外层 flex-center 影响依然居中
+                                }}
+                              >
+                                <span
+                                  style={{
+                                    fontWeight: 600,
+                                    fontSize: '12px',
+                                    color: isColHighlighted ? 'var(--interactive-accent)' : 'var(--text-normal)',
+                                  }}
+                                >
+                                  {colNode.label}
+                                </span>
+                                {colNode.aliases.length > 0 && (
+                                  <span
+                                    style={{
+                                      marginLeft: '4px',
+                                      fontSize: '11px',
+                                      fontWeight: 400,
+                                      opacity: 0.76,
+                                    }}
+                                  >
+                                    {colNode.aliases.join(' / ')}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </th>
+                        );
+                      })}
+                    </tr>
+                  </thead>
+
+                  <tbody>
+                    {filteredListRows.map((rowNode) => {
+                      const isRowHighlighted =
+                        selectedListRowId === rowNode.id || selectedListCell?.rowId === rowNode.id;
+                      const isDragTarget = dragOverRowId === rowNode.id && draggedRowId !== rowNode.id;
+                      const dotColor = getNodeColor(rowNode.label);
+                      const aliasStr = rowNode.aliases.join(' / ');
+
+                      return (
+                        <tr key={`row-${rowNode.id}`}>
+                          {/* 最左侧一列：支持拖拽排序、点击整行高亮、Command+单击打开文件；100% 纯实色背景彻底杜绝滚动重叠 */}
+                          <td
+                            draggable
+                            onMouseEnter={() => {
+                              if (dragHoverTimerRef.current) clearTimeout(dragHoverTimerRef.current);
+                              dragHoverTimerRef.current = setTimeout(() => {
+                                setHoveredRowIdForDrag(rowNode.id);
+                              }, 150);
+                            }}
+                            onMouseLeave={() => {
+                              if (dragHoverTimerRef.current) clearTimeout(dragHoverTimerRef.current);
+                              if (hoveredRowIdForDrag === rowNode.id) {
+                                setHoveredRowIdForDrag(null);
+                              }
+                            }}
+                            onDragStart={(e) => {
+                              setDraggedRowId(rowNode.id);
+                              e.dataTransfer.effectAllowed = 'move';
+                              e.dataTransfer.setData('text/plain', rowNode.id);
+                            }}
+                            onDragOver={(e) => {
+                              e.preventDefault();
+                              e.dataTransfer.dropEffect = 'move';
+                              if (dragOverRowId !== rowNode.id) {
+                                setDragOverRowId(rowNode.id);
+                              }
+                            }}
+                            onDragLeave={() => {
+                              if (dragOverRowId === rowNode.id) {
+                                setDragOverRowId(null);
+                              }
+                            }}
+                            onDrop={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              handleRowDrop(rowNode.id);
+                            }}
+                            onDragEnd={() => {
+                              setDraggedRowId(null);
+                              setDragOverRowId(null);
+                            }}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (e.metaKey || e.ctrlKey) {
+                                plugin?.app?.workspace?.openLinkText(rowNode.realName, '', true);
+                                return;
+                              }
+                              setSelectedListCell(null);
+                              setSelectedListRowId((prev) => (prev === rowNode.id ? null : rowNode.id));
+                            }}
+                            style={{
+                              position: 'sticky',
+                              left: 0,
+                              zIndex: 6,
+                              width: '196px',
+                              minWidth: '196px',
+                              maxWidth: '196px',
+                              minHeight: '56px',
+                              padding: '8px 10px',
+                              boxSizing: 'border-box',
+                              background: isRowHighlighted ? solidRowHighlightBg : solidRowBg,
+                              borderRight: isRowHighlighted
+                                ? '2px solid var(--interactive-accent)'
+                                : '1px solid var(--background-modifier-border)',
+                              borderBottom: isDragTarget
+                                ? '2px dashed var(--interactive-accent)'
+                                : '1px solid var(--background-modifier-border)',
+                              boxShadow: '2px 0 6px rgba(0, 0, 0, 0.04)',
+                              cursor: 'pointer',
+                              verticalAlign: 'middle',
+                              opacity: draggedRowId === rowNode.id ? 0.45 : 1,
+                            }}
+                            title="点击高亮整行 | 拖拽可自定义排序 | 按住 Command/Ctrl 单击打开笔记"
+                          >
+                            <div style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: '6px', width: '100%', overflow: 'hidden' }}>
+                              {/* 拖拽手柄区域：使用绝对定位和渐变背景遮挡下方文字 */}
+                              <div
+                                style={{
+                                  position: 'absolute',
+                                  left: 0,
+                                  top: 0,
+                                  bottom: 0,
+                                  width: '28px', // 渐变区域宽度
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  // 使用 solidRowHighlightBg 保证选中状态下渐变色与底色完美融合
+                                  background: isRowHighlighted 
+                                    ? `linear-gradient(to right, ${solidRowHighlightBg} 60%, transparent)` 
+                                    : `linear-gradient(to right, ${solidRowBg} 60%, transparent)`,
+                                  opacity: hoveredRowIdForDrag === rowNode.id || draggedRowId === rowNode.id ? 1 : 0,
+                                  transition: 'opacity 0.2s ease',
+                                  pointerEvents: hoveredRowIdForDrag === rowNode.id || draggedRowId === rowNode.id ? 'auto' : 'none',
+                                  zIndex: 2, // 确保在文字上方
+                                }}
+                              >
+                                <GripVertical
+                                  size={13}
+                                  color="var(--text-faint)"
+                                  style={{ 
+                                    cursor: 'grab', 
+                                    marginLeft: '-2px', // 微调图标位置
+                                  }}
+                                />
+                              </div>
+                              
+                              {/* 圆球：固定位置，为了给手柄留出视觉空间，适当调整 margin */}
+                              <span
+                                style={{
+                                  marginLeft: '4px', 
+                                  width: '9px',
+                                  height: '9px',
+                                  borderRadius: '50%',
+                                  background: dotColor,
+                                  flexShrink: 0,
+                                  boxShadow: '0 0 0 1px rgba(0,0,0,0.08)',
+                                  zIndex: 1,
+                                }}
+                              />
+                              
+                              {/* 名字与别名容器：别名另起一行，使用 Flex 列布局 */}
+                              <div
+                                style={{
+                                  display: 'flex', 
+                                  flexDirection: 'column', 
+                                  justifyContent: 'center',
+                                  flex: 1,
+                                  minWidth: 0,
+                                  lineHeight: 1.35,
+                                  zIndex: 1,
+                                }}
+                              >
+                                <span
+                                  style={{
+                                    fontWeight: isRowHighlighted ? 700 : 600,
+                                    fontSize: '13px',
+                                    color: isRowHighlighted ? 'var(--interactive-accent)' : 'var(--text-normal)',
+                                    wordBreak: 'break-word',
+                                    overflowWrap: 'anywhere',
+                                  }}
+                                >
+                                  {highlightCharInList
+                                    ? renderHighlightedText(rowNode.label, listSearchQuery)
+                                    : rowNode.label}
+                                </span>
+                                {aliasStr && (
+                                  <span
+                                    style={{
+                                      marginTop: '2px', // 别名在名字下方
+                                      fontSize: '11px',
+                                      color: 'var(--text-muted)',
+                                      opacity: 0.75,
+                                      wordBreak: 'break-word',
+                                      overflowWrap: 'anywhere',
+                                    }}
+                                    title={aliasStr}
+                                  >
+                                    {highlightCharInList
+                                      ? renderHighlightedText(aliasStr, listSearchQuery)
+                                      : aliasStr}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </td>
+
+                          {/* 中间关系区域：列宽 144px、最小行高 56px */}
+                          {sortedCharacterNodes.map((colNode) => {
+                            const isDiagonal = rowNode.id === colNode.id;
+                            const cellEdges = isDiagonal
+                              ? []
+                              : fullTimeMatrixMap[`${rowNode.id}__${colNode.id}`] || [];
+
+                            const isExactSelectedCell =
+                              selectedListCell?.rowId === rowNode.id && selectedListCell?.colId === colNode.id;
+                            const isCrosshairCell =
+                              selectedListRowId === rowNode.id ||
+                              selectedListCell?.rowId === rowNode.id ||
+                              selectedListCell?.colId === colNode.id;
+
+                            const shouldDimRelations = Boolean(selectedListCell && !isExactSelectedCell);
+
+                            let cellBg = solidRowBg;
+                            if (isDiagonal) {
+                              cellBg = solidHeaderBg;
+                            } else if (isExactSelectedCell) {
+                              cellBg = solidSelectedCellBg;
+                            } else if (isCrosshairCell) {
+                              cellBg = solidCrosshairCellBg;
+                            }
+
+                            return (
+                              <td
+                                key={`cell-${rowNode.id}-${colNode.id}`}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (isDiagonal) return;
+                                  setSelectedListRowId(null);
+                                  setSelectedListCell((prev) =>
+                                    prev && prev.rowId === rowNode.id && prev.colId === colNode.id
+                                      ? null
+                                      : { rowId: rowNode.id, colId: colNode.id }
+                                  );
+                                }}
+                                style={{
+                                  width: '144px',
+                                  minWidth: '144px',
+                                  maxWidth: '144px',
+                                  height: '56px',
+                                  padding: '6px 8px',
+                                  boxSizing: 'border-box',
+                                  background: cellBg,
+                                  borderRight: '1px solid var(--background-modifier-border)',
+                                  borderBottom: '1px solid var(--background-modifier-border)',
+                                  outline: isExactSelectedCell ? '2px solid var(--interactive-accent)' : 'none',
+                                  outlineOffset: '-2px',
+                                  textAlign: 'center',
+                                  verticalAlign: 'middle',
+                                  cursor: isDiagonal ? 'default' : 'pointer',
+                                }}
+                              >
+                                {isDiagonal ? (
+                                  <span style={{ color: 'var(--background-modifier-border)', fontSize: '11px' }}>—</span>
+                                ) : (
+                                  <div
+                                    style={{
+                                      display: 'flex',
+                                      flexDirection: listShowTime ? 'column' : 'row',
+                                      flexWrap: 'wrap',
+                                      alignItems: 'center',
+                                      justifyContent: 'center',
+                                      gap: listShowTime ? '5px' : '4px',
+                                      opacity: shouldDimRelations ? 0.18 : 1,
+                                      transition: 'opacity 0.15s ease',
+                                    }}
+                                  >
+                                    {cellEdges.map((edge, eIdx) => {
+                                      const isConflict = Boolean(edge.conflictReason);
+                                      const hasTimeRange =
+                                        Boolean(edge.timeStr) &&
+                                        edge.timeStr !== '固定' &&
+                                        !edge.timeStr.includes('固定');
+                                      const isRelSearchHit =
+                                        highlightRelInList &&
+                                        edge.label.toLowerCase().includes(listSearchQuery.trim().toLowerCase());
+
+                                      const showTimeBlock = listShowTime && hasTimeRange;
+
+                                      return (
+                                        <div
+                                          key={`${edge.key}-${eIdx}`}
+                                          onMouseEnter={(ev) => {
+                                            const pos = getRelativeMousePos(ev.clientX, ev.clientY);
+                                            if (isConflict) {
+                                              setConflictTooltip({
+                                                visible: true,
+                                                x: pos.x,
+                                                y: pos.y,
+                                                title: `⚠️ 关系冲突：${colNode.label} → ${rowNode.label} (${edge.label})`,
+                                                reason: edge.conflictReason,
+                                              });
+                                            }
+                                            if (!listShowTime && hasTimeRange) {
+                                              setTimeTooltip({
+                                                visible: true,
+                                                x: pos.x,
+                                                y: pos.y,
+                                                text: edge.timeStr,
+                                              });
+                                            }
+                                          }}
+                                          onMouseMove={(ev) => {
+                                            const pos = getRelativeMousePos(ev.clientX, ev.clientY);
+                                            if (isConflict) {
+                                              setConflictTooltip((prev) =>
+                                                prev.visible ? { ...prev, x: pos.x, y: pos.y } : prev
+                                              );
+                                            }
+                                            if (!listShowTime && hasTimeRange) {
+                                              setTimeTooltip((prev) =>
+                                                prev.visible ? { ...prev, x: pos.x, y: pos.y } : prev
+                                              );
+                                            }
+                                          }}
+                                          onMouseLeave={() => {
+                                            if (isConflict) {
+                                              setConflictTooltip((prev) =>
+                                                prev.visible ? { ...prev, visible: false } : prev
+                                              );
+                                            }
+                                            if (!listShowTime && hasTimeRange) {
+                                              setTimeTooltip((prev) =>
+                                                prev.visible ? { ...prev, visible: false } : prev
+                                              );
+                                            }
+                                          }}
+                                          style={{
+                                            display: 'inline-flex',
+                                            flexDirection: 'column',
+                                            alignItems: 'center',
+                                            justifyContent: 'center',
+                                            gap: '2px',
+                                            width: showTimeBlock ? '100%' : 'auto',
+                                            boxSizing: 'border-box',
+                                            padding: '3px 6px', // 取消了条件判断，永远是 3px 6px
+                                            borderRadius: '5px',
+                                            background: isConflict
+                                              ? 'rgba(224, 49, 49, 0.12)'
+                                              : isRelSearchHit
+                                              ? 'rgba(255, 208, 0, 0.22)'
+                                              : 'var(--background-secondary)', // 取消条件判断，永远有底色
+                                            border: isConflict
+                                              ? '1px solid rgba(224, 49, 49, 0.45)'
+                                              : '1px solid var(--background-modifier-border)', // 取消条件判断，永远有边框
+                                            color: isConflict
+                                              ? '#e03131'
+                                              : edge.isInferred
+                                              ? 'var(--text-muted)'
+                                              : 'var(--text-normal)',
+                                            fontWeight: isConflict ? 700 : edge.isInferred ? 400 : 500,
+                                            opacity: edge.isInferred && !isConflict ? 0.65 : 1,
+                                            cursor: isConflict || (!listShowTime && hasTimeRange) ? 'help' : 'pointer',
+                                          }}
+                                        >
+                                          {/* 关系名称：带微型图标提示，使用 inline-flex 保证图标与文字完美垂直居中 */}
+                                          <span
+                                            style={{
+                                              display: 'inline-flex',
+                                              alignItems: 'center',
+                                              whiteSpace: 'nowrap',
+                                              fontSize: '12px',
+                                              lineHeight: 1.3,
+                                            }}
+                                          >
+                                            {/* 有时间范围的关系：放到文案最前面，使用 marginRight 与文字隔开 */}
+                                            {hasTimeRange && (
+                                              <span 
+                                                title="此关系带有生效时间范围" 
+                                                style={{ display: 'inline-flex', alignItems: 'center', marginRight: '4px' }}
+                                              >
+                                                <Clock size={11} style={{ opacity: 0.65 }} />
+                                              </span>
+                                            )}
+                                            
+                                            {highlightRelInList
+                                              ? renderHighlightedText(edge.label, listSearchQuery)
+                                              : edge.label}
+                                          </span>
+
+                                          {showTimeBlock && (
+                                            <span
+                                              style={{
+                                                fontSize: '10px',
+                                                lineHeight: 1.25,
+                                                color: isConflict ? '#e03131' : 'var(--text-muted)',
+                                                opacity: 0.78,
+                                                fontWeight: 400,
+                                                wordBreak: 'break-all',
+                                                textAlign: 'center',
+                                              }}
+                                            >
+                                              {edge.timeStr}
+                                            </span>
+                                          )}
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* 右上角齿轮按钮 */}
         {!isPanelOpen && (
           <button
             onClick={() => setIsPanelOpen(true)}
-            style={{ position: 'absolute', top: 16, right: 16, padding: '8px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', borderRadius: '6px', cursor: 'pointer', zIndex: 10 }}
-            title="打开图谱设置"
+            style={{ position: 'absolute', top: 16, right: 16, padding: '8px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', borderRadius: '6px', cursor: 'pointer', zIndex: 30 }}
+            title={viewMode === 'graph' ? '打开图谱设置' : '打开列表设置'}
           >
             <Settings color="var(--text-muted)" size={18} />
           </button>
         )}
 
-        {/* 图谱设置面板 */}
+        {/* 右上角设置面板 */}
         {isPanelOpen && (
-          <div style={{ position: 'absolute', top: 16, right: 16, width: '320px', maxHeight: 'calc(100% - 32px)', display: 'flex', flexDirection: 'column', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', borderRadius: '8px', boxShadow: '0 8px 24px rgba(0,0,0,0.18)', fontSize: '13px', zIndex: 20, overflow: 'hidden' }}>
+          <div style={{ position: 'absolute', top: 16, right: 16, width: '320px', maxHeight: 'calc(100% - 32px)', display: 'flex', flexDirection: 'column', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', borderRadius: '8px', boxShadow: '0 8px 24px rgba(0,0,0,0.18)', fontSize: '13px', zIndex: 35, overflow: 'hidden' }}>
             <div style={{ flexShrink: 0, display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 16px', background: 'var(--background-secondary)', borderBottom: '1px solid var(--background-modifier-border)' }}>
-              <strong style={{ fontSize: '14px', color: 'var(--text-normal)' }}>图谱设置</strong>
+              <strong style={{ fontSize: '14px', color: 'var(--text-normal)' }}>
+                {viewMode === 'graph' ? '图谱设置' : '列表设置'}
+              </strong>
               <button onClick={() => setIsPanelOpen(false)} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '4px', background: 'transparent', border: 'none', borderRadius: '4px', cursor: 'pointer', color: 'var(--text-muted)' }} title="关闭设置">
                 <X size={18} />
               </button>
             </div>
 
-            <div style={{ flex: 1, overflowY: 'auto', padding: '14px 16px' }}>
-              <Accordion defaultOpen={true} title="筛选">
-                <div style={{ display: 'flex', alignItems: 'center', background: 'var(--background-secondary)', borderRadius: '4px', padding: '4px 8px', marginBottom: '10px', border: '1px solid var(--background-modifier-border)' }}>
-                  <Search color="var(--text-muted)" size={14} />
-                  <input
-                    type="text"
-                    placeholder="搜索人物或关系"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    style={{ border: 'none', background: 'transparent', outline: 'none', marginLeft: '6px', flex: 1, color: 'var(--text-normal)', fontSize: '12px' }}
-                  />
-                  {searchQuery && (
-                    <button
-                      onClick={() => setSearchQuery('')}
-                      style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '2px', background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }}
-                      title="清空搜索内容"
-                    >
-                      <X size={14} />
-                    </button>
-                  )}
-                </div>
-                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', marginBottom: '8px' }}>
-                  <input type="checkbox" checked={showIsolated} onChange={(e) => setShowIsolated(e.target.checked)} />
-                  显示孤立节点
-                </label>
-                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)' }}>
-                  <input type="checkbox" checked={enableInferred} onChange={(e) => setEnableInferred(e.target.checked)} />
-                  开启推算关系
-                </label>
+            {viewMode === 'graph' ? (
+              <div style={{ flex: 1, overflowY: 'auto', padding: '14px 16px' }}>
+                <Accordion defaultOpen={true} title="筛选">
+                  <div style={{ display: 'flex', alignItems: 'center', background: 'var(--background-secondary)', borderRadius: '4px', padding: '4px 8px', marginBottom: '10px', border: '1px solid var(--background-modifier-border)' }}>
+                    <Search color="var(--text-muted)" size={14} />
+                    <input
+                      type="text"
+                      placeholder="搜索人物或关系"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      style={{ border: 'none', background: 'transparent', outline: 'none', marginLeft: '6px', flex: 1, color: 'var(--text-normal)', fontSize: '12px' }}
+                    />
+                    {searchQuery && (
+                      <button
+                        onClick={() => setSearchQuery('')}
+                        style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '2px', background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }}
+                        title="清空搜索内容"
+                      >
+                        <X size={14} />
+                      </button>
+                    )}
+                  </div>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', marginBottom: '8px' }}>
+                    <input type="checkbox" checked={showIsolated} onChange={(e) => setShowIsolated(e.target.checked)} />
+                    显示孤立节点
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)' }}>
+                    <input type="checkbox" checked={enableInferred} onChange={(e) => setEnableInferred(e.target.checked)} />
+                    开启推算关系
+                  </label>
 
-                {enableInferred && (
+                  {enableInferred && (
+                    <div
+                      style={{
+                        marginTop: '8px',
+                        marginLeft: '18px',
+                        padding: '8px 10px',
+                        background: 'var(--background-secondary)',
+                        borderRadius: '6px',
+                        borderLeft: '2px solid var(--interactive-accent)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '6px',
+                      }}
+                    >
+                      <label
+                        style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', fontSize: '12px' }}
+                        title="仅展示直接反向关系与核心直系血亲/同门闭环（如兄弟共享父母、夫妻共享儿女）"
+                      >
+                        <input
+                          type="radio"
+                          name="inferDisplayMode"
+                          checked={inferDisplayMode === 'partial'}
+                          onChange={() => setInferDisplayMode('partial')}
+                        />
+                        展示部分推算关系
+                      </label>
+                      <label
+                        style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', fontSize: '12px' }}
+                        title="展示包含跨代（祖孙/师祖）、旁系（叔伯/姑舅）与姻亲（嫂子/岳父母/大舅哥）在内的全部全局推算关系"
+                      >
+                        <input
+                          type="radio"
+                          name="inferDisplayMode"
+                          checked={inferDisplayMode === 'all'}
+                          onChange={() => setInferDisplayMode('all')}
+                        />
+                        展示全部推算关系
+                      </label>
+                    </div>
+                  )}
+                </Accordion>
+
+                <Accordion defaultOpen={false} title="颜色组">
+                  {colorGroups.map((cg, i) => (
+                    <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px' }}>
+                      <input type="color" value={cg.color} onChange={(e) => { const next = [...colorGroups]; if(next[i]){ next[i].color = e.target.value; setColorGroups(next); } }} style={{ width: '24px', height: '24px', padding: 0, border: 'none', cursor: 'pointer' }} />
+                      <input type="text" value={cg.keyword} onChange={(e) => { const next = [...colorGroups]; if(next[i]){ next[i].keyword = e.target.value; setColorGroups(next); } }} style={{ flex: 1, padding: '4px 6px', border: '1px solid var(--background-modifier-border)', borderRadius: '4px', background: 'var(--background-primary)', color: 'var(--text-normal)' }} placeholder="包含关键词..." />
+                      <X color="#ef4444" cursor="pointer" size={14} onClick={() => setColorGroups(colorGroups.filter((_, idx) => idx !== i))} />
+                    </div>
+                  ))}
+                  <button onClick={() => setColorGroups([...colorGroups, { keyword: '', color: '#3b82f6' }])} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: '100%', padding: '5px', background: 'var(--background-secondary)', border: '1px dashed var(--background-modifier-border)', borderRadius: '4px', cursor: 'pointer', marginTop: '8px', color: 'var(--text-normal)' }}>
+                    <Plus size={14} style={{ marginRight: '4px' }} /> 添加颜色组
+                  </button>
+                </Accordion>
+
+                <Accordion defaultOpen={true} title="外观">
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', marginBottom: '10px', color: 'var(--text-normal)' }}>
+                    <input type="checkbox" checked={showArrow} onChange={(e) => setShowArrow(e.target.checked)} />
+                    显示连线箭头
+                  </label>
+                  <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
+                    节点大小: {nodeSize}
+                    <input type="range" min="3" max="22" step="1" value={nodeSize} onChange={(e) => setNodeSize(parseInt(e.target.value, 10))} style={{ width: '100%' }} />
+                  </label>
+                  <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
+                    节点文字大小: {nodeFontSize}px
+                    <input type="range" min="9" max="24" step="1" value={nodeFontSize} onChange={(e) => setNodeFontSize(parseInt(e.target.value, 10))} style={{ width: '100%' }} />
+                  </label>
+                  <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
+                    连线粗细 (含箭头大小): {linkThickness}
+                    <input type="range" min="0.5" max="5" step="0.5" value={linkThickness} onChange={(e) => setLinkThickness(parseFloat(e.target.value))} style={{ width: '100%' }} />
+                  </label>
+                  <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
+                    节点不透明度: {nodeOpacity}
+                    <input type="range" min="0.1" max="1" step="0.05" value={nodeOpacity} onChange={(e) => setNodeOpacity(parseFloat(e.target.value))} style={{ width: '100%' }} />
+                  </label>
+                  <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
+                    节点文本不透明度: {nodeTextOpacity}
+                    <input type="range" min="0" max="1" step="0.05" value={nodeTextOpacity} onChange={(e) => setNodeTextOpacity(parseFloat(e.target.value))} style={{ width: '100%' }} />
+                  </label>
+                  <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
+                    连线不透明度: {linkOpacity}
+                    <input type="range" min="0.1" max="1" step="0.05" value={linkOpacity} onChange={(e) => setLinkOpacity(parseFloat(e.target.value))} style={{ width: '100%' }} />
+                  </label>
+                  <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
+                    连线文本不透明度: {linkTextOpacity}
+                    <input type="range" min="0" max="1" step="0.05" value={linkTextOpacity} onChange={(e) => setLinkTextOpacity(parseFloat(e.target.value))} style={{ width: '100%' }} />
+                  </label>
+                  <label style={{ display: 'block', color: 'var(--text-normal)' }}>
+                    非焦点不透明度: {unselectedOpacity}
+                    <input type="range" min="0.05" max="1" step="0.05" value={unselectedOpacity} onChange={(e) => setUnselectedOpacity(parseFloat(e.target.value))} style={{ width: '100%' }} />
+                  </label>
+                </Accordion>
+
+                <Accordion defaultOpen={true} title="力度">
+                  <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
+                    图谱向心力: {centerStrength.toFixed(2)}
+                    <input type="range" min="0" max="1" step="0.05" value={centerStrength} onChange={(e) => setCenterStrength(parseFloat(e.target.value))} style={{ width: '100%' }} />
+                  </label>
+                  <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
+                    节点间的排斥力: {repelStrength}
+                    <input type="range" min="0" max="1000" step="20" value={repelStrength} onChange={(e) => setRepelStrength(parseInt(e.target.value, 10))} style={{ width: '100%' }} />
+                  </label>
+                  <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
+                    相连节点间的吸引力: {linkAttractStrength.toFixed(2)}
+                    <input type="range" min="0.05" max="1" step="0.05" value={linkAttractStrength} onChange={(e) => setLinkAttractStrength(parseFloat(e.target.value))} style={{ width: '100%' }} />
+                  </label>
+                  <label style={{ display: 'block', color: 'var(--text-normal)' }}>
+                    连线长度: {linkDistance}
+                    <input type="range" min="30" max="350" step="10" value={linkDistance} onChange={(e) => setLinkDistance(parseInt(e.target.value, 10))} style={{ width: '100%' }} />
+                  </label>
+                </Accordion>
+
+                <Accordion defaultOpen={true} title="时间轴范围与跳转">
+                  <div style={{ marginBottom: '8px', padding: '8px', background: 'var(--background-secondary)', borderRadius: '6px' }}>
+                    <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '6px' }}>起始时间 (年 / 月 / 日)</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                      <input
+                        type="number"
+                        min="1"
+                        value={startYMD.year}
+                        onChange={(e) => setStartYMD({ ...startYMD, year: Math.max(1, parseInt(e.target.value, 10) || 1) })}
+                        style={{ width: '64px', padding: '3px 4px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', color: 'var(--text-normal)', borderRadius: '4px', fontSize: '12px' }}
+                      />
+                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>年</span>
+                      <input
+                        type="number"
+                        min="1"
+                        max="12"
+                        value={startYMD.month}
+                        onChange={(e) => setStartYMD({ ...startYMD, month: Math.min(12, Math.max(1, parseInt(e.target.value, 10) || 1)) })}
+                        style={{ width: '42px', padding: '3px 4px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', color: 'var(--text-normal)', borderRadius: '4px', fontSize: '12px' }}
+                      />
+                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>月</span>
+                      <input
+                        type="number"
+                        min="1"
+                        max="31"
+                        value={startYMD.day}
+                        onChange={(e) => setStartYMD({ ...startYMD, day: Math.min(31, Math.max(1, parseInt(e.target.value, 10) || 1)) })}
+                        style={{ width: '42px', padding: '3px 4px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', color: 'var(--text-normal)', borderRadius: '4px', fontSize: '12px' }}
+                      />
+                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>日</span>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '2px', fontSize: '11px', color: 'var(--text-normal)', marginLeft: '2px', cursor: 'pointer' }}>
+                        <input type="checkbox" checked={startYMD.isBC} onChange={(e) => setStartYMD({ ...startYMD, isBC: e.target.checked })} />
+                        BC
+                      </label>
+                    </div>
+                  </div>
+
+                  <div style={{ marginBottom: '8px', padding: '8px', background: 'var(--background-secondary)', borderRadius: '6px' }}>
+                    <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '6px' }}>结束时间 (年 / 月 / 日)</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                      <input
+                        type="number"
+                        min="1"
+                        value={endYMD.year}
+                        onChange={(e) => setEndYMD({ ...endYMD, year: Math.max(1, parseInt(e.target.value, 10) || 1) })}
+                        style={{ width: '64px', padding: '3px 4px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', color: 'var(--text-normal)', borderRadius: '4px', fontSize: '12px' }}
+                      />
+                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>年</span>
+                      <input
+                        type="number"
+                        min="1"
+                        max="12"
+                        value={endYMD.month}
+                        onChange={(e) => setEndYMD({ ...endYMD, month: Math.min(12, Math.max(1, parseInt(e.target.value, 10) || 1)) })}
+                        style={{ width: '42px', padding: '3px 4px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', color: 'var(--text-normal)', borderRadius: '4px', fontSize: '12px' }}
+                      />
+                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>月</span>
+                      <input
+                        type="number"
+                        min="1"
+                        max="31"
+                        value={endYMD.day}
+                        onChange={(e) => setEndYMD({ ...endYMD, day: Math.min(31, Math.max(1, parseInt(e.target.value, 10) || 1)) })}
+                        style={{ width: '42px', padding: '3px 4px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', color: 'var(--text-normal)', borderRadius: '4px', fontSize: '12px' }}
+                      />
+                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>日</span>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '2px', fontSize: '11px', color: 'var(--text-normal)', marginLeft: '2px', cursor: 'pointer' }}>
+                        <input type="checkbox" checked={endYMD.isBC} onChange={(e) => setEndYMD({ ...endYMD, isBC: e.target.checked })} />
+                        BC
+                      </label>
+                    </div>
+                  </div>
+
+                  <div style={{ marginBottom: '10px', padding: '8px', background: 'var(--background-secondary)', borderRadius: '6px' }}>
+                    <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '6px' }}>精准跳转到指定日期</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' }}>
+                      <input
+                        type="number"
+                        min="1"
+                        value={jumpYMD.year}
+                        onChange={(e) => setJumpYMD({ ...jumpYMD, year: Math.max(1, parseInt(e.target.value, 10) || 1) })}
+                        style={{ width: '58px', padding: '3px 4px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', color: 'var(--text-normal)', borderRadius: '4px', fontSize: '12px' }}
+                      />
+                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>年</span>
+                      <input
+                        type="number"
+                        min="1"
+                        max="12"
+                        value={jumpYMD.month}
+                        onChange={(e) => setJumpYMD({ ...jumpYMD, month: Math.min(12, Math.max(1, parseInt(e.target.value, 10) || 1)) })}
+                        style={{ width: '38px', padding: '3px 4px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', color: 'var(--text-normal)', borderRadius: '4px', fontSize: '12px' }}
+                      />
+                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>月</span>
+                      <input
+                        type="number"
+                        min="1"
+                        max="31"
+                        value={jumpYMD.day}
+                        onChange={(e) => setJumpYMD({ ...jumpYMD, day: Math.min(31, Math.max(1, parseInt(e.target.value, 10) || 1)) })}
+                        style={{ width: '38px', padding: '3px 4px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', color: 'var(--text-normal)', borderRadius: '4px', fontSize: '12px' }}
+                      />
+                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>日</span>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '2px', fontSize: '11px', color: 'var(--text-normal)', cursor: 'pointer' }}>
+                        <input type="checkbox" checked={jumpYMD.isBC} onChange={(e) => setJumpYMD({ ...jumpYMD, isBC: e.target.checked })} />
+                        BC
+                      </label>
+                      <button
+                        onClick={handleJumpDate}
+                        style={{ marginLeft: 'auto', padding: '3px 8px', background: 'var(--interactive-accent)', color: 'var(--text-on-accent)', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '12px' }}
+                      >
+                        跳转
+                      </button>
+                    </div>
+                  </div>
+
+                  <button
+                    onClick={() => setCurrentYear(getTodayDecimalYear())}
+                    style={{ width: '100%', display: 'flex', justifyContent: 'center', alignItems: 'center', padding: '6px', background: 'var(--background-modifier-border)', color: 'var(--text-normal)', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
+                  >
+                    <Calendar size={14} style={{ marginRight: '5px' }} /> 回到今天 ({new Date().toLocaleDateString('zh-CN')})
+                  </button>
+                </Accordion>
+              </div>
+            ) : (
+              /* 列表视图专属设置面板 */
+              <div style={{ flex: 1, overflowY: 'auto', padding: '14px 16px' }}>
+                <Accordion defaultOpen={true} title="搜索与显示设置">
+                  {/* 带范围选择器（全部 / 人物 / 关系）的组合搜索框 */}
                   <div
                     style={{
-                      marginTop: '8px',
-                      marginLeft: '18px',
-                      padding: '8px 10px',
+                      display: 'flex',
+                      alignItems: 'center',
                       background: 'var(--background-secondary)',
                       borderRadius: '6px',
-                      borderLeft: '2px solid var(--interactive-accent)',
-                      display: 'flex',
-                      flexDirection: 'column',
-                      gap: '6px',
+                      padding: '3px 6px',
+                      marginBottom: '12px',
+                      border: '1px solid var(--background-modifier-border)',
+                      gap: '4px',
                     }}
                   >
-                    <label
-                      style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', fontSize: '12px' }}
-                      title="仅展示直接反向关系与核心直系血亲/同门闭环（如兄弟共享父母、夫妻共享儿女）"
+                    <Search color="var(--text-muted)" size={14} style={{ flexShrink: 0, marginLeft: '2px' }} />
+                    <select
+                      value={listSearchScope}
+                      onChange={(e) => setListSearchScope(e.target.value as 'all' | 'character' | 'relation')}
+                      style={{
+                        border: 'none',
+                        background: 'var(--background-primary)',
+                        color: 'var(--text-normal)',
+                        fontSize: '11px',
+                        padding: '2px 4px',
+                        borderRadius: '4px',
+                        cursor: 'pointer',
+                        outline: 'none',
+                      }}
+                      title="选择搜索范围"
                     >
-                      <input
-                        type="radio"
-                        name="inferDisplayMode"
-                        checked={inferDisplayMode === 'partial'}
-                        onChange={() => setInferDisplayMode('partial')}
-                      />
-                      展示部分推算关系
-                    </label>
-                    <label
-                      style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', fontSize: '12px' }}
-                      title="展示包含跨代（祖孙/师祖）、旁系（叔伯/姑舅）与姻亲（嫂子/岳父母/大舅哥）在内的全部全局推算关系"
+                      <option value="all">全部</option>
+                      <option value="character">人物</option>
+                      <option value="relation">关系</option>
+                    </select>
+                    <input
+                      type="text"
+                      placeholder={
+                        listSearchScope === 'character'
+                          ? '筛选左侧人物...'
+                          : listSearchScope === 'relation'
+                          ? '搜索关系称谓...'
+                          : '搜索人物或关系...'
+                      }
+                      value={listSearchQuery}
+                      onChange={(e) => setListSearchQuery(e.target.value)}
+                      style={{
+                        border: 'none',
+                        background: 'transparent',
+                        outline: 'none',
+                        flex: 1,
+                        minWidth: 0,
+                        color: 'var(--text-normal)',
+                        fontSize: '12px',
+                      }}
+                    />
+                    {listSearchQuery && (
+                      <button
+                        onClick={() => setListSearchQuery('')}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          padding: '2px',
+                          background: 'transparent',
+                          border: 'none',
+                          cursor: 'pointer',
+                          color: 'var(--text-muted)',
+                        }}
+                        title="清空搜索内容"
+                      >
+                        <X size={14} />
+                      </button>
+                    )}
+                  </div>
+
+                  {/* 人物排序选择器（行列同步更新，切回手动排序自动恢复上次自定义顺序） */}
+                  <div style={{ marginBottom: '12px' }}>
+                    <div style={{ fontSize: '12px', color: 'var(--text-normal)', marginBottom: '6px', fontWeight: 500 }}>
+                      人物排序方式
+                    </div>
+                    <select
+                      value={listSortMode}
+                      onChange={(e) => triggerSortWithLoading(e.target.value as ListSortMode)}
+                      style={{
+                        width: '100%',
+                        padding: '5px 8px',
+                        fontSize: '12px',
+                        background: 'var(--background-secondary)',
+                        color: 'var(--text-normal)',
+                        border: '1px solid var(--background-modifier-border)',
+                        borderRadius: '6px',
+                        cursor: 'pointer',
+                        outline: 'none',
+                      }}
                     >
-                      <input
-                        type="radio"
-                        name="inferDisplayMode"
-                        checked={inferDisplayMode === 'all'}
-                        onChange={() => setInferDisplayMode('all')}
-                      />
-                      展示全部推算关系
-                    </label>
+                      <option value="explorer">与文件管理器一致 (含 Flexplorer)</option>
+                      <option value="manual">手动拖拽排序 (自定义记忆)</option>
+                      <option value="name-asc">名称 (A - Z)</option>
+                      <option value="name-desc">名称 (Z - A)</option>
+                      <option value="mtime-desc">修改时间 (最新在前)</option>
+                      <option value="mtime-asc">修改时间 (最早在前)</option>
+                      <option value="ctime-desc">创建时间 (最新在前)</option>
+                      <option value="ctime-asc">创建时间 (最早在前)</option>
+                    </select>
+                    <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px', lineHeight: 1.4 }}>
+                      💡 直接上下拖拽表格最左侧人物行即可调整自定义顺序，顶部人物行将自动同步。
+                    </div>
                   </div>
-                )}
-              </Accordion>
 
-              <Accordion defaultOpen={false} title="颜色组">
-                {colorGroups.map((cg, i) => (
-                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px' }}>
-                    <input type="color" value={cg.color} onChange={(e) => { const next = [...colorGroups]; if(next[i]){ next[i].color = e.target.value; setColorGroups(next); } }} style={{ width: '24px', height: '24px', padding: 0, border: 'none', cursor: 'pointer' }} />
-                    <input type="text" value={cg.keyword} onChange={(e) => { const next = [...colorGroups]; if(next[i]){ next[i].keyword = e.target.value; setColorGroups(next); } }} style={{ flex: 1, padding: '4px 6px', border: '1px solid var(--background-modifier-border)', borderRadius: '4px', background: 'var(--background-primary)', color: 'var(--text-normal)' }} placeholder="包含关键词..." />
-                    <X color="#ef4444" cursor="pointer" size={14} onClick={() => setColorGroups(colorGroups.filter((_, idx) => idx !== i))} />
-                  </div>
-                ))}
-                <button onClick={() => setColorGroups([...colorGroups, { keyword: '', color: '#3b82f6' }])} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: '100%', padding: '5px', background: 'var(--background-secondary)', border: '1px dashed var(--background-modifier-border)', borderRadius: '4px', cursor: 'pointer', marginTop: '8px', color: 'var(--text-normal)' }}>
-                  <Plus size={14} style={{ marginRight: '4px' }} /> 添加颜色组
-                </button>
-              </Accordion>
+                  {/* 开启推算关系 */}
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', marginBottom: '8px' }}>
+                    <input type="checkbox" checked={enableInferred} onChange={(e) => setEnableInferred(e.target.checked)} />
+                    开启推算关系
+                  </label>
 
-              <Accordion defaultOpen={true} title="外观">
-                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', marginBottom: '10px', color: 'var(--text-normal)' }}>
-                  <input type="checkbox" checked={showArrow} onChange={(e) => setShowArrow(e.target.checked)} />
-                  显示连线箭头
-                </label>
-                <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
-                  节点大小: {nodeSize}
-                  <input type="range" min="3" max="22" step="1" value={nodeSize} onChange={(e) => setNodeSize(parseInt(e.target.value, 10))} style={{ width: '100%' }} />
-                </label>
-                <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
-                  节点文字大小: {nodeFontSize}px
-                  <input type="range" min="9" max="24" step="1" value={nodeFontSize} onChange={(e) => setNodeFontSize(parseInt(e.target.value, 10))} style={{ width: '100%' }} />
-                </label>
-                <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
-                  连线粗细 (含箭头大小): {linkThickness}
-                  <input type="range" min="0.5" max="5" step="0.5" value={linkThickness} onChange={(e) => setLinkThickness(parseFloat(e.target.value))} style={{ width: '100%' }} />
-                </label>
-                <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
-                  节点不透明度: {nodeOpacity}
-                  <input type="range" min="0.1" max="1" step="0.05" value={nodeOpacity} onChange={(e) => setNodeOpacity(parseFloat(e.target.value))} style={{ width: '100%' }} />
-                </label>
-                <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
-                  节点文本不透明度: {nodeTextOpacity}
-                  <input type="range" min="0" max="1" step="0.05" value={nodeTextOpacity} onChange={(e) => setNodeTextOpacity(parseFloat(e.target.value))} style={{ width: '100%' }} />
-                </label>
-                <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
-                  连线不透明度: {linkOpacity}
-                  <input type="range" min="0.1" max="1" step="0.05" value={linkOpacity} onChange={(e) => setLinkOpacity(parseFloat(e.target.value))} style={{ width: '100%' }} />
-                </label>
-                <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
-                  连线文本不透明度: {linkTextOpacity}
-                  <input type="range" min="0" max="1" step="0.05" value={linkTextOpacity} onChange={(e) => setLinkTextOpacity(parseFloat(e.target.value))} style={{ width: '100%' }} />
-                </label>
-                <label style={{ display: 'block', color: 'var(--text-normal)' }}>
-                  非焦点不透明度: {unselectedOpacity}
-                  <input type="range" min="0.05" max="1" step="0.05" value={unselectedOpacity} onChange={(e) => setUnselectedOpacity(parseFloat(e.target.value))} style={{ width: '100%' }} />
-                </label>
-              </Accordion>
-
-              <Accordion defaultOpen={true} title="力度">
-                <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
-                  图谱向心力: {centerStrength.toFixed(2)}
-                  <input type="range" min="0" max="1" step="0.05" value={centerStrength} onChange={(e) => setCenterStrength(parseFloat(e.target.value))} style={{ width: '100%' }} />
-                </label>
-                <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
-                  节点间的排斥力: {repelStrength}
-                  <input type="range" min="0" max="1000" step="20" value={repelStrength} onChange={(e) => setRepelStrength(parseInt(e.target.value, 10))} style={{ width: '100%' }} />
-                </label>
-                <label style={{ display: 'block', marginBottom: '10px', color: 'var(--text-normal)' }}>
-                  相连节点间的吸引力: {linkAttractStrength.toFixed(2)}
-                  <input type="range" min="0.05" max="1" step="0.05" value={linkAttractStrength} onChange={(e) => setLinkAttractStrength(parseFloat(e.target.value))} style={{ width: '100%' }} />
-                </label>
-                <label style={{ display: 'block', color: 'var(--text-normal)' }}>
-                  连线长度: {linkDistance}
-                  <input type="range" min="30" max="350" step="10" value={linkDistance} onChange={(e) => setLinkDistance(parseInt(e.target.value, 10))} style={{ width: '100%' }} />
-                </label>
-              </Accordion>
-
-              <Accordion defaultOpen={true} title="时间轴范围与跳转">
-                <div style={{ marginBottom: '8px', padding: '8px', background: 'var(--background-secondary)', borderRadius: '6px' }}>
-                  <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '6px' }}>起始时间 (年 / 月 / 日)</div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                    <input
-                      type="number"
-                      min="1"
-                      value={startYMD.year}
-                      onChange={(e) => setStartYMD({ ...startYMD, year: Math.max(1, parseInt(e.target.value, 10) || 1) })}
-                      style={{ width: '64px', padding: '3px 4px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', color: 'var(--text-normal)', borderRadius: '4px', fontSize: '12px' }}
-                    />
-                    <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>年</span>
-                    <input
-                      type="number"
-                      min="1"
-                      max="12"
-                      value={startYMD.month}
-                      onChange={(e) => setStartYMD({ ...startYMD, month: Math.min(12, Math.max(1, parseInt(e.target.value, 10) || 1)) })}
-                      style={{ width: '42px', padding: '3px 4px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', color: 'var(--text-normal)', borderRadius: '4px', fontSize: '12px' }}
-                    />
-                    <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>月</span>
-                    <input
-                      type="number"
-                      min="1"
-                      max="31"
-                      value={startYMD.day}
-                      onChange={(e) => setStartYMD({ ...startYMD, day: Math.min(31, Math.max(1, parseInt(e.target.value, 10) || 1)) })}
-                      style={{ width: '42px', padding: '3px 4px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', color: 'var(--text-normal)', borderRadius: '4px', fontSize: '12px' }}
-                    />
-                    <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>日</span>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '2px', fontSize: '11px', color: 'var(--text-normal)', marginLeft: '2px', cursor: 'pointer' }}>
-                      <input type="checkbox" checked={startYMD.isBC} onChange={(e) => setStartYMD({ ...startYMD, isBC: e.target.checked })} />
-                      BC
-                    </label>
-                  </div>
-                </div>
-
-                <div style={{ marginBottom: '8px', padding: '8px', background: 'var(--background-secondary)', borderRadius: '6px' }}>
-                  <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '6px' }}>结束时间 (年 / 月 / 日)</div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                    <input
-                      type="number"
-                      min="1"
-                      value={endYMD.year}
-                      onChange={(e) => setEndYMD({ ...endYMD, year: Math.max(1, parseInt(e.target.value, 10) || 1) })}
-                      style={{ width: '64px', padding: '3px 4px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', color: 'var(--text-normal)', borderRadius: '4px', fontSize: '12px' }}
-                    />
-                    <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>年</span>
-                    <input
-                      type="number"
-                      min="1"
-                      max="12"
-                      value={endYMD.month}
-                      onChange={(e) => setEndYMD({ ...endYMD, month: Math.min(12, Math.max(1, parseInt(e.target.value, 10) || 1)) })}
-                      style={{ width: '42px', padding: '3px 4px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', color: 'var(--text-normal)', borderRadius: '4px', fontSize: '12px' }}
-                    />
-                    <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>月</span>
-                    <input
-                      type="number"
-                      min="1"
-                      max="31"
-                      value={endYMD.day}
-                      onChange={(e) => setEndYMD({ ...endYMD, day: Math.min(31, Math.max(1, parseInt(e.target.value, 10) || 1)) })}
-                      style={{ width: '42px', padding: '3px 4px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', color: 'var(--text-normal)', borderRadius: '4px', fontSize: '12px' }}
-                    />
-                    <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>日</span>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '2px', fontSize: '11px', color: 'var(--text-normal)', marginLeft: '2px', cursor: 'pointer' }}>
-                      <input type="checkbox" checked={endYMD.isBC} onChange={(e) => setEndYMD({ ...endYMD, isBC: e.target.checked })} />
-                      BC
-                    </label>
-                  </div>
-                </div>
-
-                <div style={{ marginBottom: '10px', padding: '8px', background: 'var(--background-secondary)', borderRadius: '6px' }}>
-                  <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '6px' }}>精准跳转到指定日期</div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' }}>
-                    <input
-                      type="number"
-                      min="1"
-                      value={jumpYMD.year}
-                      onChange={(e) => setJumpYMD({ ...jumpYMD, year: Math.max(1, parseInt(e.target.value, 10) || 1) })}
-                      style={{ width: '58px', padding: '3px 4px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', color: 'var(--text-normal)', borderRadius: '4px', fontSize: '12px' }}
-                    />
-                    <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>年</span>
-                    <input
-                      type="number"
-                      min="1"
-                      max="12"
-                      value={jumpYMD.month}
-                      onChange={(e) => setJumpYMD({ ...jumpYMD, month: Math.min(12, Math.max(1, parseInt(e.target.value, 10) || 1)) })}
-                      style={{ width: '38px', padding: '3px 4px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', color: 'var(--text-normal)', borderRadius: '4px', fontSize: '12px' }}
-                    />
-                    <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>月</span>
-                    <input
-                      type="number"
-                      min="1"
-                      max="31"
-                      value={jumpYMD.day}
-                      onChange={(e) => setJumpYMD({ ...jumpYMD, day: Math.min(31, Math.max(1, parseInt(e.target.value, 10) || 1)) })}
-                      style={{ width: '38px', padding: '3px 4px', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', color: 'var(--text-normal)', borderRadius: '4px', fontSize: '12px' }}
-                    />
-                    <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>日</span>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '2px', fontSize: '11px', color: 'var(--text-normal)', cursor: 'pointer' }}>
-                      <input type="checkbox" checked={jumpYMD.isBC} onChange={(e) => setJumpYMD({ ...jumpYMD, isBC: e.target.checked })} />
-                      BC
-                    </label>
-                    <button
-                      onClick={handleJumpDate}
-                      style={{ marginLeft: 'auto', padding: '3px 8px', background: 'var(--interactive-accent)', color: 'var(--text-on-accent)', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '12px' }}
+                  {enableInferred && (
+                    <div
+                      style={{
+                        marginTop: '6px',
+                        marginBottom: '10px',
+                        marginLeft: '18px',
+                        padding: '8px 10px',
+                        background: 'var(--background-secondary)',
+                        borderRadius: '6px',
+                        borderLeft: '2px solid var(--interactive-accent)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '6px',
+                      }}
                     >
-                      跳转
-                    </button>
-                  </div>
-                </div>
+                      <label
+                        style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', fontSize: '12px' }}
+                        title="仅展示直接反向关系与核心直系血亲/同门闭环（如兄弟共享父母、夫妻共享儿女）"
+                      >
+                        <input
+                          type="radio"
+                          name="listInferDisplayMode"
+                          checked={inferDisplayMode === 'partial'}
+                          onChange={() => setInferDisplayMode('partial')}
+                        />
+                        展示部分推算关系
+                      </label>
+                      <label
+                        style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', fontSize: '12px' }}
+                        title="展示包含跨代（祖孙/师祖）、旁系（叔伯/姑舅）与姻亲（嫂子/岳父母/大舅哥）在内的全部全局推算关系"
+                      >
+                        <input
+                          type="radio"
+                          name="listInferDisplayMode"
+                          checked={inferDisplayMode === 'all'}
+                          onChange={() => setInferDisplayMode('all')}
+                        />
+                        展示全部推算关系
+                      </label>
+                    </div>
+                  )}
 
-                <button
-                  onClick={() => setCurrentYear(getTodayDecimalYear())}
-                  style={{ width: '100%', display: 'flex', justifyContent: 'center', alignItems: 'center', padding: '6px', background: 'var(--background-modifier-border)', color: 'var(--text-normal)', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
-                >
-                  <Calendar size={14} style={{ marginRight: '5px' }} /> 回到今天 ({new Date().toLocaleDateString('zh-CN')})
-                </button>
-              </Accordion>
-            </div>
+                  {/* 开启时间显示 */}
+                  <label
+                    style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', marginTop: '6px' }}
+                    title="开启后在有时间范围的关系下方直接弱化显示时间；关闭时鼠标悬停在关系上可查看时间提示"
+                  >
+                    <input type="checkbox" checked={listShowTime} onChange={(e) => setListShowTime(e.target.checked)} />
+                    开启时间显示
+                  </label>
+                </Accordion>
+              </div>
+            )}
           </div>
         )}
       </div>
 
-      {/* 底部全汉化 Aeon 风格可缩放双层刻度时间轴 */}
-      <div
-        ref={timelineWrapRef}
-        onWheel={handleTimelineWheel}
-        style={{
-          height: '82px',
-          width: '100%',
-          background: 'var(--background-secondary)',
-          borderTop: '1px solid var(--background-modifier-border)',
-          display: 'flex',
-          flexDirection: 'column',
-          userSelect: 'none',
-          position: 'relative',
-          zIndex: 12,
-        }}
-      >
+      {/* 底部时间轴：仅在图谱模式下渲染 */}
+      {viewMode === 'graph' && (
         <div
-          onMouseDown={handleTimelineMouseDown}
+          ref={timelineWrapRef}
+          onWheel={handleTimelineWheel}
           style={{
-            position: 'relative',
-            height: '52px',
+            height: '82px',
             width: '100%',
-            overflow: 'hidden',
-            cursor: 'ew-resize',
-            borderBottom: '1px solid var(--background-modifier-border)',
+            background: 'var(--background-secondary)',
+            borderTop: '1px solid var(--background-modifier-border)',
+            display: 'flex',
+            flexDirection: 'column',
+            userSelect: 'none',
+            position: 'relative',
+            zIndex: 12,
           }}
-          title="左右拖拽平移时间，滚动鼠标滚轮放大/缩小时间刻度精度"
         >
-          {timelineTicks.primaryTicks.map((t, idx) => (
+          <div
+            onMouseDown={handleTimelineMouseDown}
+            style={{
+              position: 'relative',
+              height: '52px',
+              width: '100%',
+              overflow: 'hidden',
+              cursor: 'ew-resize',
+              borderBottom: '1px solid var(--background-modifier-border)',
+            }}
+            title="左右拖拽平移时间，滚动鼠标滚轮放大/缩小时间刻度精度"
+          >
+            {timelineTicks.primaryTicks.map((t, idx) => (
+              <div
+                key={`pri-${idx}`}
+                style={{
+                  position: 'absolute',
+                  left: `${t.pos}px`,
+                  top: '4px',
+                  height: '20px',
+                  paddingLeft: '6px',
+                  borderLeft: '1px solid var(--background-modifier-border)',
+                  fontSize: '11px',
+                  fontWeight: 700,
+                  color: 'var(--text-normal)',
+                  whiteSpace: 'nowrap',
+                  pointerEvents: 'none',
+                }}
+              >
+                {t.label}
+              </div>
+            ))}
+
+            {timelineTicks.secondaryTicks.map((t, idx) => (
+              <div
+                key={`sec-${idx}`}
+                style={{
+                  position: 'absolute',
+                  left: `${t.pos}px`,
+                  bottom: '0px',
+                  transform: 'translateX(-50%)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  pointerEvents: 'none',
+                }}
+              >
+                <span style={{ fontSize: '10px', color: 'var(--text-muted)', marginBottom: '2px', whiteSpace: 'nowrap' }}>{t.label}</span>
+                <div
+                  style={{
+                    width: '1px',
+                    height: t.isMajor ? '6px' : '4px',
+                    background: t.isMajor ? 'var(--text-muted)' : 'var(--background-modifier-border)',
+                  }}
+                />
+              </div>
+            ))}
+
             <div
-              key={`pri-${idx}`}
               style={{
                 position: 'absolute',
-                left: `${t.pos}px`,
-                top: '4px',
-                height: '20px',
-                paddingLeft: '6px',
-                borderLeft: '1px solid var(--background-modifier-border)',
+                left: '50%',
+                top: 0,
+                bottom: 0,
+                width: '2px',
+                background: 'var(--interactive-accent)',
+                transform: 'translateX(-50%)',
+                pointerEvents: 'none',
+              }}
+            />
+            <div
+              style={{
+                position: 'absolute',
+                left: '50%',
+                top: '2px',
+                transform: 'translateX(-50%)',
+                padding: '1px 8px',
+                background: 'var(--interactive-accent)',
+                color: 'var(--text-on-accent)',
                 fontSize: '11px',
-                fontWeight: 700,
-                color: 'var(--text-normal)',
+                fontWeight: 600,
+                borderRadius: '10px',
                 whiteSpace: 'nowrap',
                 pointerEvents: 'none',
+                boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
               }}
             >
-              {t.label}
+              {formatCurrentTimeBadge(currentYear, viewSpan)}
             </div>
-          ))}
-
-          {timelineTicks.secondaryTicks.map((t, idx) => (
-            <div
-              key={`sec-${idx}`}
-              style={{
-                position: 'absolute',
-                left: `${t.pos}px`,
-                bottom: '0px',
-                transform: 'translateX(-50%)',
-                display: 'flex',
-                flexDirection: 'column',
-                alignItems: 'center',
-                pointerEvents: 'none',
-              }}
-            >
-              <span style={{ fontSize: '10px', color: 'var(--text-muted)', marginBottom: '2px', whiteSpace: 'nowrap' }}>{t.label}</span>
-              <div
-                style={{
-                  width: '1px',
-                  height: t.isMajor ? '6px' : '4px',
-                  background: t.isMajor ? 'var(--text-muted)' : 'var(--background-modifier-border)',
-                }}
-              />
-            </div>
-          ))}
+          </div>
 
           <div
             style={{
-              position: 'absolute',
-              left: '50%',
-              top: 0,
-              bottom: 0,
-              width: '2px',
-              background: 'var(--interactive-accent)',
-              transform: 'translateX(-50%)',
-              pointerEvents: 'none',
-            }}
-          />
-          <div
-            style={{
-              position: 'absolute',
-              left: '50%',
-              top: '2px',
-              transform: 'translateX(-50%)',
-              padding: '1px 8px',
-              background: 'var(--interactive-accent)',
-              color: 'var(--text-on-accent)',
-              fontSize: '11px',
-              fontWeight: 600,
-              borderRadius: '10px',
-              whiteSpace: 'nowrap',
-              pointerEvents: 'none',
-              boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
+              height: '30px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '0 12px',
+              gap: '12px',
+              background: 'var(--background-primary)',
             }}
           >
-            {formatCurrentTimeBadge(currentYear, viewSpan)}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <button
+                onClick={() => setViewSpan((prev) => Math.min(3000, prev * 1.6))}
+                style={{ padding: '2px 4px', background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex', alignItems: 'center' }}
+                title="缩小时间轴视图 (跨度变大)"
+              >
+                <ZoomOut size={14} />
+              </button>
+              <select
+                value={
+                  viewSpan >= 80
+                    ? '100'
+                    : viewSpan >= 10
+                    ? '12'
+                    : viewSpan >= 1
+                    ? '2'
+                    : viewSpan >= 0.05
+                    ? '0.16'
+                    : '0.015'
+                }
+                onChange={(e) => setViewSpan(parseFloat(e.target.value))}
+                style={{
+                  padding: '1px 6px',
+                  fontSize: '11px',
+                  background: 'var(--background-secondary)',
+                  color: 'var(--text-normal)',
+                  border: '1px solid var(--background-modifier-border)',
+                  borderRadius: '4px',
+                }}
+                title="切换时间轴视图精度"
+              >
+                <option value="100">年代视图 (100年)</option>
+                <option value="12">年视图 (12年)</option>
+                <option value="2">月/季视图 (2年)</option>
+                <option value="0.16">日视图 (2个月)</option>
+                <option value="0.015">小时视图 (5天)</option>
+              </select>
+              <button
+                onClick={() => setViewSpan((prev) => Math.max(0.005, prev * 0.6))}
+                style={{ padding: '2px 4px', background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex', alignItems: 'center' }}
+                title="放大时间轴视图 (精度变高)"
+              >
+                <ZoomIn size={14} />
+              </button>
+            </div>
+
+            <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span style={{ fontSize: '10px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+                {formatRangeLabel(startYMD)}
+              </span>
+              <input
+                type="range"
+                min={minRangeDecimal}
+                max={maxRangeDecimal}
+                step={Math.max(0.0005, viewSpan / 200)}
+                value={Math.max(minRangeDecimal, Math.min(maxRangeDecimal, currentYear))}
+                onChange={(e) => setCurrentYear(parseFloat(e.target.value))}
+                style={{ flex: 1, cursor: 'pointer', height: '4px' }}
+              />
+              <span style={{ fontSize: '10px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+                {formatRangeLabel(endYMD)}
+              </span>
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+              <button
+                onClick={() => setCurrentYear((y) => Math.max(minRangeDecimal, y - viewSpan * 0.1))}
+                style={{ padding: '1px 6px', fontSize: '11px', background: 'var(--background-secondary)', border: '1px solid var(--background-modifier-border)', borderRadius: '3px', cursor: 'pointer', color: 'var(--text-normal)' }}
+                title="向过去步进"
+              >
+                ‹
+              </button>
+              <button
+                onClick={() => setCurrentYear((y) => Math.min(maxRangeDecimal, y + viewSpan * 0.1))}
+                style={{ padding: '1px 6px', fontSize: '11px', background: 'var(--background-secondary)', border: '1px solid var(--background-modifier-border)', borderRadius: '3px', cursor: 'pointer', color: 'var(--text-normal)' }}
+                title="向未来步进"
+              >
+                ›
+              </button>
+            </div>
           </div>
         </div>
-
-        <div
-          style={{
-            height: '30px',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            padding: '0 12px',
-            gap: '12px',
-            background: 'var(--background-primary)',
-          }}
-        >
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <button
-              onClick={() => setViewSpan((prev) => Math.min(3000, prev * 1.6))}
-              style={{ padding: '2px 4px', background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex', alignItems: 'center' }}
-              title="缩小时间轴视图 (跨度变大)"
-            >
-              <ZoomOut size={14} />
-            </button>
-            <select
-              value={
-                viewSpan >= 80
-                  ? '100'
-                  : viewSpan >= 10
-                  ? '12'
-                  : viewSpan >= 1
-                  ? '2'
-                  : viewSpan >= 0.05
-                  ? '0.16'
-                  : '0.015'
-              }
-              onChange={(e) => setViewSpan(parseFloat(e.target.value))}
-              style={{
-                padding: '1px 6px',
-                fontSize: '11px',
-                background: 'var(--background-secondary)',
-                color: 'var(--text-normal)',
-                border: '1px solid var(--background-modifier-border)',
-                borderRadius: '4px',
-              }}
-              title="切换时间轴视图精度"
-            >
-              <option value="100">年代视图 (100年)</option>
-              <option value="12">年视图 (12年)</option>
-              <option value="2">月/季视图 (2年)</option>
-              <option value="0.16">日视图 (2个月)</option>
-              <option value="0.015">小时视图 (5天)</option>
-            </select>
-            <button
-              onClick={() => setViewSpan((prev) => Math.max(0.005, prev * 0.6))}
-              style={{ padding: '2px 4px', background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex', alignItems: 'center' }}
-              title="放大时间轴视图 (精度变高)"
-            >
-              <ZoomIn size={14} />
-            </button>
-          </div>
-
-          <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <span style={{ fontSize: '10px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
-              {formatRangeLabel(startYMD)}
-            </span>
-            <input
-              type="range"
-              min={minRangeDecimal}
-              max={maxRangeDecimal}
-              step={Math.max(0.0005, viewSpan / 200)}
-              value={Math.max(minRangeDecimal, Math.min(maxRangeDecimal, currentYear))}
-              onChange={(e) => setCurrentYear(parseFloat(e.target.value))}
-              style={{ flex: 1, cursor: 'pointer', height: '4px' }}
-            />
-            <span style={{ fontSize: '10px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
-              {formatRangeLabel(endYMD)}
-            </span>
-          </div>
-
-          <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-            <button
-              onClick={() => setCurrentYear((y) => Math.max(minRangeDecimal, y - viewSpan * 0.1))}
-              style={{ padding: '1px 6px', fontSize: '11px', background: 'var(--background-secondary)', border: '1px solid var(--background-modifier-border)', borderRadius: '3px', cursor: 'pointer', color: 'var(--text-normal)' }}
-              title="向过去步进"
-            >
-              ‹
-            </button>
-            <button
-              onClick={() => setCurrentYear((y) => Math.min(maxRangeDecimal, y + viewSpan * 0.1))}
-              style={{ padding: '1px 6px', fontSize: '11px', background: 'var(--background-secondary)', border: '1px solid var(--background-modifier-border)', borderRadius: '3px', cursor: 'pointer', color: 'var(--text-normal)' }}
-              title="向未来步进"
-            >
-              ›
-            </button>
-          </div>
-        </div>
-      </div>
+      )}
     </div>
   );
 }
