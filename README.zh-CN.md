@@ -40,7 +40,7 @@
 
 ## 📦 安装说明 (Installation)
 
-*(注：待上架 Obsidian 社区插件后，可在软件内直接搜索 RelateTime 安装。)*
+**现在已经上架 Obsidian 社区的 插件市场，可在软件内直接搜索 RelateTime 安装。**
 
 **手动安装：**
 1. 前往 GitHub 仓库的 [Releases 页面](https://github.com/你的用户名/obsidian-relatetime/releases)。
