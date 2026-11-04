@@ -489,6 +489,46 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
   const [draggedRowId, setDraggedRowId] = useState<string | null>(null);
   const [dragOverRowId, setDragOverRowId] = useState<string | null>(null);
 
+  // 列表列宽控制：第一列支持鼠标拖拽缩放，其余列在未开启时间显示时由滑块控制，开启时间显示时固定为 168px
+  const [firstColWidth, setFirstColWidth] = useState<number>(() => savedUi.firstColWidth ?? 196);
+  const [listColWidth, setListColWidth] = useState<number>(() => savedUi.listColWidth ?? 120);
+  const effectiveColWidth = listShowTime ? 168 : listColWidth;
+
+  const [isResizingFirstCol, setIsResizingFirstCol] = useState<boolean>(false);
+  const isResizingFirstColRef = useRef<boolean>(false);
+  const firstColResizeStartXRef = useRef<number>(0);
+  const firstColResizeStartWidthRef = useRef<number>(196);
+
+  const handleFirstColResizeStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    isResizingFirstColRef.current = true;
+    setIsResizingFirstCol(true);
+    firstColResizeStartXRef.current = e.clientX;
+    firstColResizeStartWidthRef.current = firstColWidth;
+  }, [firstColWidth]);
+
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!isResizingFirstColRef.current) return;
+      const dx = e.clientX - firstColResizeStartXRef.current;
+      const nextW = Math.max(110, Math.min(480, firstColResizeStartWidthRef.current + dx));
+      setFirstColWidth(nextW);
+    };
+    const handleMouseUp = () => {
+      if (isResizingFirstColRef.current) {
+        isResizingFirstColRef.current = false;
+        setIsResizingFirstCol(false);
+      }
+    };
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, []);
+
   const [selectedListRowId, setSelectedListRowId] = useState<string | null>(null);
   const [selectedListCell, setSelectedListCell] = useState<{ rowId: string; colId: string } | null>(null);
   const [timeTooltip, setTimeTooltip] = useState<{ visible: boolean; x: number; y: number; text: string }>({
@@ -588,6 +628,8 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       listShowTime,
       listSortMode,
       customManualOrder,
+      firstColWidth,
+      listColWidth,
       isPanelOpen,
       searchQuery,
       showIsolated,
@@ -628,6 +670,8 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     listShowTime,
     listSortMode,
     customManualOrder,
+    firstColWidth,
+    listColWidth,
     isPanelOpen,
     searchQuery,
     showIsolated,
@@ -2422,21 +2466,27 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       });
     svg.call(zoom);
 
+    // 计算对齐 Obsidian 原生手感的物理参数
+    const effectiveDistance = Math.max(25, linkDistance * (1.35 - linkAttractStrength * 0.85));
+    const effectiveLinkStrength = 0.08 + Math.pow(linkAttractStrength, 1.3) * 0.85;
+    const effectiveRepel = -(Math.max(15, repelStrength * 1.8));
+
     const sim = d3
       .forceSimulation<NodeData, LinkData>()
+      .velocityDecay(0.32) // 降低阻尼，让拖拽滑块时节点像 Obsidian 原生图谱一样丝滑游动
       .force(
         'link',
         d3
           .forceLink<NodeData, LinkData>()
           .id((d) => d.id)
-          .distance(linkDistance)
-          .strength(linkAttractStrength)
+          .distance(effectiveDistance)
+          .strength(effectiveLinkStrength)
       )
-      .force('charge', d3.forceManyBody<NodeData>().strength(-repelStrength))
-      .force('x', d3.forceX<NodeData>(width / 2).strength(centerStrength * 0.25))
-      .force('y', d3.forceY<NodeData>(height / 2).strength(centerStrength * 0.25))
-      .force('collide', d3.forceCollide<NodeData>().radius(nodeSize + 18).iterations(2))
-      .alphaDecay(0.035)
+      .force('charge', d3.forceManyBody<NodeData>().strength(effectiveRepel).distanceMax(1200))
+      .force('x', d3.forceX<NodeData>(width / 2).strength(Math.pow(centerStrength, 1.2) * 0.45))
+      .force('y', d3.forceY<NodeData>(height / 2).strength(Math.pow(centerStrength, 1.2) * 0.45))
+      .force('collide', d3.forceCollide<NodeData>().radius(nodeSize + 14).iterations(2))
+      .alphaDecay(0.022) // 延长物理收敛时间，让滑块实时反馈更明显
       .on('tick', () => {
         updateGraphPositions();
       });
@@ -2639,35 +2689,45 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     const width = svgRef.current.clientWidth || 800;
     const height = svgRef.current.clientHeight || 600;
 
+    // 1. 吸引力与连线长度联动：吸引力越大，不仅拉力越强，还会主动收缩目标间距，实现真正的“拉近相连节点”
+    const effectiveDistance = Math.max(25, linkDistance * (1.35 - linkAttractStrength * 0.85));
+    const effectiveLinkStrength = 0.08 + Math.pow(linkAttractStrength, 1.3) * 0.85;
+
     const linkForce = sim.force('link') as d3.ForceLink<NodeData, LinkData>;
     if (linkForce) {
-      linkForce.distance(linkDistance);
-      linkForce.strength(linkAttractStrength);
+      linkForce.distance(effectiveDistance).strength(effectiveLinkStrength);
+      // 关键：重新绑定 links 以强制 D3 刷新每个连接的内部缓存参数
+      linkForce.links(simLinksRef.current);
     }
 
+    // 2. 排斥力：放大响应曲线，且即使滑到 0 也保留微弱的 -15 防重叠力，保证调节吸引力时永远有对抗力可拉扯
+    const effectiveRepel = -(Math.max(15, repelStrength * 1.8));
     const chargeForce = sim.force('charge') as d3.ForceManyBody<NodeData>;
     if (chargeForce) {
-      chargeForce.strength(-repelStrength);
+      chargeForce.strength(effectiveRepel).distanceMax(1200);
     }
 
+    // 3. 向心力：当设为 0 时完全释放，调大时平滑向画布中心聚拢
+    const effectiveCenter = Math.pow(centerStrength, 1.2) * 0.45;
     const forceX = sim.force('x') as d3.ForceX<NodeData>;
     if (forceX) {
-      forceX.x(width / 2).strength(centerStrength * 0.28);
+      forceX.x(width / 2).strength(effectiveCenter);
     }
 
     const forceY = sim.force('y') as d3.ForceY<NodeData>;
     if (forceY) {
-      forceY.y(height / 2).strength(centerStrength * 0.28);
+      forceY.y(height / 2).strength(effectiveCenter);
     }
 
     const collideForce = sim.force('collide') as d3.ForceCollide<NodeData>;
     if (collideForce) {
-      collideForce.radius(nodeSize + 16);
+      collideForce.radius(nodeSize + 14);
     }
 
     updateGraphPositions();
     applyVisualStyles();
-    sim.alpha(0.35).restart();
+    // 给予充足的 alpha 动能（0.75），让拖动滑块时图谱立即产生肉眼可见的聚拢/散开动画
+    sim.alpha(0.75).restart();
   }, [centerStrength, repelStrength, linkAttractStrength, linkDistance, nodeSize, updateGraphPositions, applyVisualStyles]);
 
   useEffect(() => {
@@ -2688,7 +2748,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     applyVisualStyles,
   ]);
 
-  // 全汉化双层时间轴刻度计算
+  // 全汉化双层时间轴刻度计算（超出设定起止时间范围的刻度自动隐藏）
   const timelineTicks = useMemo(() => {
     const halfSpan = viewSpan / 2;
     const startVal = currentYear - halfSpan;
@@ -2698,6 +2758,8 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     const secondaryTicks: { pos: number; label: string; isMajor?: boolean }[] = [];
 
     const toPx = (val: number) => ((val - startVal) / viewSpan) * timelineWidth;
+    // 严格判断刻度值是否在用户设置的 [起始时间, 结束时间] 范围内（附带极小浮点容差）
+    const isInRange = (val: number) => val >= minRangeDecimal - 1e-6 && val <= maxRangeDecimal + 1e-6;
 
     const formatYearZh = (y: number, withSuffix = true) => {
       if (y <= 0) {
@@ -2721,6 +2783,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       const firstSec = Math.floor(startVal / secStep) * secStep;
 
       for (let y = firstSec; y <= endVal + secStep; y += secStep) {
+        if (!isInRange(y)) continue;
         const px = toPx(y);
         if (px >= -40 && px <= timelineWidth + 40) {
           secondaryTicks.push({ pos: px, label: formatYearZh(y, false), isMajor: y % priStep === 0 });
@@ -2735,12 +2798,17 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       const monthStep = viewSpan > 2.2 ? 3 : 1;
 
       for (let y = startY; y <= endY; y++) {
-        const yPx = toPx(y);
-        if (yPx >= -60 && yPx <= timelineWidth + 60) {
-          primaryTicks.push({ pos: yPx, label: formatYearZh(y, true) });
+        const yEndVal = y + 1 - 1e-6;
+        if (y <= maxRangeDecimal + 1e-6 && yEndVal >= minRangeDecimal - 1e-6) {
+          const clampY = Math.max(y, minRangeDecimal);
+          const yPx = toPx(clampY);
+          if (yPx >= -60 && yPx <= timelineWidth + 60) {
+            primaryTicks.push({ pos: yPx, label: formatYearZh(y, true) });
+          }
         }
         for (let m = 0; m < 12; m += monthStep) {
           const mVal = y + m / 12;
+          if (!isInRange(mVal)) continue;
           const mPx = toPx(mVal);
           if (mPx >= -30 && mPx <= timelineWidth + 30) {
             secondaryTicks.push({ pos: mPx, label: MONTH_NAMES_ZH[m] || '', isMajor: m === 0 });
@@ -2755,15 +2823,20 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       for (let y = startY; y <= endY; y++) {
         let accDays = 0;
         for (let m = 0; m < 12; m++) {
-          const mStartVal = y + accDays / 365;
-          const mPx = toPx(mStartVal);
-          if (mPx >= -80 && mPx <= timelineWidth + 80) {
-            primaryTicks.push({ pos: mPx, label: `${formatYearZh(y, true)} ${MONTH_NAMES_ZH[m]}` });
-          }
           const daysInM = MONTH_DAYS[m] || 30;
+          const mStartVal = y + accDays / 365;
+          const mEndVal = y + (accDays + daysInM - 0.01) / 365;
+          if (mStartVal <= maxRangeDecimal + 1e-6 && mEndVal >= minRangeDecimal - 1e-6) {
+            const clampM = Math.max(mStartVal, minRangeDecimal);
+            const mPx = toPx(clampM);
+            if (mPx >= -80 && mPx <= timelineWidth + 80) {
+              primaryTicks.push({ pos: mPx, label: `${formatYearZh(y, true)} ${MONTH_NAMES_ZH[m]}` });
+            }
+          }
           for (let d = 1; d <= daysInM; d += dayStep) {
             if (dayStep === 7 && d > 25) continue;
             const dVal = y + (accDays + d - 1) / 365;
+            if (!isInRange(dVal)) continue;
             const dPx = toPx(dVal);
             if (dPx >= -20 && dPx <= timelineWidth + 20) {
               secondaryTicks.push({ pos: dPx, label: `${d}日`, isMajor: d === 1 });
@@ -2780,17 +2853,20 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
 
       for (let dIdx = firstDayIdx; dIdx <= lastDayIdx; dIdx++) {
         const dVal = dIdx * dayUnit;
-        const dPx = toPx(dVal);
-        if (dPx >= -140 && dPx <= timelineWidth + 140) {
-          const info = decomposeDecimalYear(dVal + 0.00001);
-          const yStr = info.isBC ? `${info.displayYear} BC` : `${info.displayYear}年`;
-          primaryTicks.push({
-            pos: dPx,
-            label: `${yStr} ${info.monthNameZh} ${info.day}日 ${info.weekNameZh}`,
-          });
+        if (isInRange(dVal)) {
+          const dPx = toPx(dVal);
+          if (dPx >= -140 && dPx <= timelineWidth + 140) {
+            const info = decomposeDecimalYear(dVal + 0.00001);
+            const yStr = info.isBC ? `${info.displayYear} BC` : `${info.displayYear}年`;
+            primaryTicks.push({
+              pos: dPx,
+              label: `${yStr} ${info.monthNameZh} ${info.day}日 ${info.weekNameZh}`,
+            });
+          }
         }
         for (let hr = 0; hr < 24; hr += hourStep) {
           const hVal = dVal + (hr / 24) * dayUnit;
+          if (!isInRange(hVal)) continue;
           const hPx = toPx(hVal);
           if (hPx >= -30 && hPx <= timelineWidth + 30) {
             secondaryTicks.push({ pos: hPx, label: `${String(hr).padStart(2, '0')}:00`, isMajor: hr === 0 });
@@ -2799,7 +2875,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       }
     }
     return { primaryTicks, secondaryTicks };
-  }, [currentYear, viewSpan, timelineWidth]);
+  }, [currentYear, viewSpan, timelineWidth, minRangeDecimal, maxRangeDecimal]);
 
   const isDraggingTimeline = useRef(false);
   const dragStartX = useRef(0);
@@ -3340,12 +3416,26 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                   style={{
                     borderCollapse: 'separate',
                     borderSpacing: 0,
-                    width: 'max-content',
-                    minWidth: '100%',
+                    width: '100%',
+                    height: '100%', // 让表格高度撑满外框，以便最后一行把第一列竖线延伸到底部
+                    tableLayout: 'fixed',
                     fontSize: '12px',
                     userSelect: 'none',
                   }}
                 >
+                  <colgroup>
+                    {/* 第一列：严格锁死拖拽宽度 */}
+                    <col style={{ width: `${firstColWidth}px`, minWidth: `${firstColWidth}px`, maxWidth: `${firstColWidth}px` }} />
+                    {/* 关系列：严格锁死滑块宽度 */}
+                    {sortedCharacterNodes.map((colNode) => (
+                      <col
+                        key={`col-def-${colNode.id}`}
+                        style={{ width: `${effectiveColWidth}px`, minWidth: `${effectiveColWidth}px`, maxWidth: `${effectiveColWidth}px` }}
+                      />
+                    ))}
+                    {/* 右侧弹性占位尾列：不设固定宽，专门吸收右侧剩余空白，绝不挤压前面的列 */}
+                    <col style={{ width: 'auto' }} />
+                  </colgroup>
                   <thead>
                     <tr>
                       {/* 左上角固定交叉表头（Z-index 最高，纯实色背景防穿透） */}
@@ -3355,14 +3445,17 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                           top: 0,
                           left: 0,
                           zIndex: 12,
-                          width: '196px',
-                          minWidth: '196px',
-                          maxWidth: '196px',
-                          minHeight: '46px', // 修改点：取消固定 height，允许被右侧撑高
+                          width: `${firstColWidth}px`,
+                          minWidth: `${firstColWidth}px`,
+                          maxWidth: `${firstColWidth}px`,
+                          flexShrink: 0,
+                          minHeight: '46px',
                           padding: '8px 12px',
                           boxSizing: 'border-box',
                           background: solidHeaderBg,
-                          borderRight: '1px solid var(--background-modifier-border)',
+                          borderRight: isResizingFirstCol
+                            ? '2px solid var(--interactive-accent)'
+                            : '1px solid var(--background-modifier-border)',
                           borderBottom: '1px solid var(--background-modifier-border)',
                           boxShadow: '2px 2px 5px rgba(0, 0, 0, 0.04)',
                           textAlign: 'left',
@@ -3372,6 +3465,20 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                         }}
                       >
                         人物 \ 对象
+                        <div
+                          onMouseDown={handleFirstColResizeStart}
+                          onClick={(e) => e.stopPropagation()}
+                          style={{
+                            position: 'absolute',
+                            top: 0,
+                            right: '-4px',
+                            bottom: 0,
+                            width: '8px',
+                            cursor: 'col-resize',
+                            zIndex: 20,
+                          }}
+                          title="左右拖拽调整首列宽度"
+                        />
                       </th>
 
                       {/* 最顶部一行：名字完整展示，别名紧跟其后。溢出截断（最多4行） */}
@@ -3395,9 +3502,9 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                               position: 'sticky',
                               top: 0,
                               zIndex: 8,
-                              width: '144px',
-                              minWidth: '144px',
-                              maxWidth: '144px',
+                              width: `${effectiveColWidth}px`,
+                              minWidth: `${effectiveColWidth}px`,
+                              maxWidth: `${effectiveColWidth}px`,
                               minHeight: '46px', // 修改点：取消固定 height，文字换行时自动撑高
                               padding: '6px 10px',
                               boxSizing: 'border-box',
@@ -3459,6 +3566,17 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                           </th>
                         );
                       })}
+                      {/* 顶部表头右侧延伸占位列：保持表头背景色与底边横线贯通至最右端 */}
+                      <th
+                        style={{
+                          position: 'sticky',
+                          top: 0,
+                          zIndex: 7,
+                          background: solidHeaderBg,
+                          borderBottom: '1px solid var(--background-modifier-border)',
+                          padding: 0,
+                        }}
+                      />
                     </tr>
                   </thead>
 
@@ -3526,16 +3644,18 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                               position: 'sticky',
                               left: 0,
                               zIndex: 6,
-                              width: '196px',
-                              minWidth: '196px',
-                              maxWidth: '196px',
+                              width: `${firstColWidth}px`,
+                              minWidth: `${firstColWidth}px`,
+                              maxWidth: `${firstColWidth}px`,
+                              flexShrink: 0,
                               minHeight: '56px',
                               padding: '8px 10px',
                               boxSizing: 'border-box',
                               background: isRowHighlighted ? solidRowHighlightBg : solidRowBg,
-                              borderRight: isRowHighlighted
-                                ? '2px solid var(--interactive-accent)'
-                                : '1px solid var(--background-modifier-border)',
+                              borderRight:
+                                isRowHighlighted || isResizingFirstCol
+                                  ? '2px solid var(--interactive-accent)'
+                                  : '1px solid var(--background-modifier-border)',
                               borderBottom: isDragTarget
                                 ? '2px dashed var(--interactive-accent)'
                                 : '1px solid var(--background-modifier-border)',
@@ -3635,6 +3755,27 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                                 )}
                               </div>
                             </div>
+
+                            {/* 首列右边界拖拽调整宽度热区 */}
+                            <div
+                              draggable={false}
+                              onMouseDown={handleFirstColResizeStart}
+                              onDragStart={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                              }}
+                              onClick={(e) => e.stopPropagation()}
+                              style={{
+                                position: 'absolute',
+                                top: 0,
+                                right: '-4px',
+                                bottom: 0,
+                                width: '8px',
+                                cursor: 'col-resize',
+                                zIndex: 20,
+                              }}
+                              title="左右拖拽调整此列宽度"
+                            />
                           </td>
 
                           {/* 中间关系区域：列宽 144px、最小行高 56px */}
@@ -3676,9 +3817,9 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                                   );
                                 }}
                                 style={{
-                                  width: '144px',
-                                  minWidth: '144px',
-                                  maxWidth: '144px',
+                                  width: `${effectiveColWidth}px`,
+                                  minWidth: `${effectiveColWidth}px`,
+                                  maxWidth: `${effectiveColWidth}px`,
                                   height: '56px',
                                   padding: '6px 8px',
                                   boxSizing: 'border-box',
@@ -3843,9 +3984,60 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                               </td>
                             );
                           })}
+                          {/* 每一行最右侧延伸占位格：让每一行的底边横线完美贯通到最右侧 */}
+                          <td
+                            style={{
+                              background:
+                                selectedListRowId === rowNode.id || selectedListCell?.rowId === rowNode.id
+                                  ? solidCrosshairCellBg
+                                  : solidRowBg,
+                              borderBottom: '1px solid var(--background-modifier-border)',
+                              padding: 0,
+                            }}
+                          />
                         </tr>
                       );
                     })}
+
+                    {/* 底部弹性占位尾行：当人物行数不满一屏时自动撑满剩余高度，让第一列的右侧竖线一直延伸到最底部 */}
+                    <tr style={{ height: '100%' }}>
+                      <td
+                        style={{
+                          position: 'sticky',
+                          left: 0,
+                          zIndex: 5,
+                          background: solidRowBg,
+                          borderRight: isResizingFirstCol
+                            ? '2px solid var(--interactive-accent)'
+                            : '1px solid var(--background-modifier-border)',
+                          boxShadow: '2px 0 6px rgba(0, 0, 0, 0.04)',
+                          padding: 0,
+                        }}
+                      >
+                        {/* 底部留白区的第一列右边界同样支持拖拽调宽 */}
+                        <div
+                          onMouseDown={handleFirstColResizeStart}
+                          onClick={(e) => e.stopPropagation()}
+                          style={{
+                            position: 'absolute',
+                            top: 0,
+                            right: '-4px',
+                            bottom: 0,
+                            width: '8px',
+                            cursor: 'col-resize',
+                            zIndex: 20,
+                          }}
+                          title="左右拖拽调整此列宽度"
+                        />
+                      </td>
+                      <td
+                        colSpan={sortedCharacterNodes.length + 1}
+                        style={{
+                          background: solidRowBg,
+                          padding: 0,
+                        }}
+                      />
+                    </tr>
                   </tbody>
                 </table>
               </div>
@@ -4144,174 +4336,210 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                 </Accordion>
               </div>
             ) : (
-              /* 列表视图专属设置面板 */
+              /* 列表视图专属设置面板（移除折叠包裹，直接平铺展示） */
               <div style={{ flex: 1, overflowY: 'auto', padding: '14px 16px' }}>
-                <Accordion defaultOpen={true} title="搜索与显示设置">
-                  {/* 带范围选择器（全部 / 人物 / 关系）的组合搜索框 */}
-                  <div
+                {/* 带范围选择器（全部 / 人物 / 关系）的组合搜索框 */}
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    background: 'var(--background-secondary)',
+                    borderRadius: '6px',
+                    padding: '3px 6px',
+                    marginBottom: '12px',
+                    border: '1px solid var(--background-modifier-border)',
+                    gap: '4px',
+                  }}
+                >
+                  <Search color="var(--text-muted)" size={14} style={{ flexShrink: 0, marginLeft: '2px' }} />
+                  <select
+                    value={listSearchScope}
+                    onChange={(e) => setListSearchScope(e.target.value as 'all' | 'character' | 'relation')}
                     style={{
-                      display: 'flex',
-                      alignItems: 'center',
+                      border: 'none',
+                      background: 'var(--background-primary)',
+                      color: 'var(--text-normal)',
+                      fontSize: '11px',
+                      padding: '2px 4px',
+                      borderRadius: '4px',
+                      cursor: 'pointer',
+                      outline: 'none',
+                    }}
+                    title="选择搜索范围"
+                  >
+                    <option value="all">全部</option>
+                    <option value="character">人物</option>
+                    <option value="relation">关系</option>
+                  </select>
+                  <input
+                    type="text"
+                    placeholder={
+                      listSearchScope === 'character'
+                        ? '筛选左侧人物...'
+                        : listSearchScope === 'relation'
+                        ? '搜索关系称谓...'
+                        : '搜索人物或关系...'
+                    }
+                    value={listSearchQuery}
+                    onChange={(e) => setListSearchQuery(e.target.value)}
+                    style={{
+                      border: 'none',
+                      background: 'transparent',
+                      outline: 'none',
+                      flex: 1,
+                      minWidth: 0,
+                      color: 'var(--text-normal)',
+                      fontSize: '12px',
+                    }}
+                  />
+                  {listSearchQuery && (
+                    <button
+                      onClick={() => setListSearchQuery('')}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        padding: '2px',
+                        background: 'transparent',
+                        border: 'none',
+                        cursor: 'pointer',
+                        color: 'var(--text-muted)',
+                      }}
+                      title="清空搜索内容"
+                    >
+                      <X size={14} />
+                    </button>
+                  )}
+                </div>
+
+                {/* 人物排序选择器 */}
+                <div style={{ marginBottom: '12px' }}>
+                  <div style={{ fontSize: '12px', color: 'var(--text-normal)', marginBottom: '6px', fontWeight: 500 }}>
+                    人物排序方式
+                  </div>
+                  <select
+                    value={listSortMode}
+                    onChange={(e) => triggerSortWithLoading(e.target.value as ListSortMode)}
+                    style={{
+                      width: '100%',
+                      padding: '5px 8px',
+                      fontSize: '12px',
                       background: 'var(--background-secondary)',
-                      borderRadius: '6px',
-                      padding: '3px 6px',
-                      marginBottom: '12px',
+                      color: 'var(--text-normal)',
                       border: '1px solid var(--background-modifier-border)',
-                      gap: '4px',
+                      borderRadius: '6px',
+                      cursor: 'pointer',
+                      outline: 'none',
                     }}
                   >
-                    <Search color="var(--text-muted)" size={14} style={{ flexShrink: 0, marginLeft: '2px' }} />
-                    <select
-                      value={listSearchScope}
-                      onChange={(e) => setListSearchScope(e.target.value as 'all' | 'character' | 'relation')}
-                      style={{
-                        border: 'none',
-                        background: 'var(--background-primary)',
-                        color: 'var(--text-normal)',
-                        fontSize: '11px',
-                        padding: '2px 4px',
-                        borderRadius: '4px',
-                        cursor: 'pointer',
-                        outline: 'none',
-                      }}
-                      title="选择搜索范围"
-                    >
-                      <option value="all">全部</option>
-                      <option value="character">人物</option>
-                      <option value="relation">关系</option>
-                    </select>
-                    <input
-                      type="text"
-                      placeholder={
-                        listSearchScope === 'character'
-                          ? '筛选左侧人物...'
-                          : listSearchScope === 'relation'
-                          ? '搜索关系称谓...'
-                          : '搜索人物或关系...'
-                      }
-                      value={listSearchQuery}
-                      onChange={(e) => setListSearchQuery(e.target.value)}
-                      style={{
-                        border: 'none',
-                        background: 'transparent',
-                        outline: 'none',
-                        flex: 1,
-                        minWidth: 0,
-                        color: 'var(--text-normal)',
-                        fontSize: '12px',
-                      }}
-                    />
-                    {listSearchQuery && (
-                      <button
-                        onClick={() => setListSearchQuery('')}
-                        style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                          padding: '2px',
-                          background: 'transparent',
-                          border: 'none',
-                          cursor: 'pointer',
-                          color: 'var(--text-muted)',
-                        }}
-                        title="清空搜索内容"
-                      >
-                        <X size={14} />
-                      </button>
-                    )}
+                    <option value="explorer">与文件管理器一致 (含 Flexplorer)</option>
+                    <option value="manual">手动拖拽排序 (自定义记忆)</option>
+                    <option value="name-asc">名称 (A - Z)</option>
+                    <option value="name-desc">名称 (Z - A)</option>
+                    <option value="mtime-desc">修改时间 (最新在前)</option>
+                    <option value="mtime-asc">修改时间 (最早在前)</option>
+                    <option value="ctime-desc">创建时间 (最新在前)</option>
+                    <option value="ctime-asc">创建时间 (最早在前)</option>
+                  </select>
+                  <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px', lineHeight: 1.4 }}>
+                    💡 直接上下拖拽表格最左侧人物行即可调整自定义顺序，顶部人物行将自动同步。
                   </div>
+                </div>
 
-                  {/* 人物排序选择器（行列同步更新，切回手动排序自动恢复上次自定义顺序） */}
-                  <div style={{ marginBottom: '12px' }}>
-                    <div style={{ fontSize: '12px', color: 'var(--text-normal)', marginBottom: '6px', fontWeight: 500 }}>
-                      人物排序方式
+                {/* 开启推算关系 */}
+                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', marginBottom: '8px' }}>
+                  <input type="checkbox" checked={enableInferred} onChange={(e) => setEnableInferred(e.target.checked)} />
+                  开启推算关系
+                </label>
+
+                {enableInferred && (
+                  <div
+                    style={{
+                      marginTop: '6px',
+                      marginBottom: '10px',
+                      marginLeft: '18px',
+                      padding: '8px 10px',
+                      background: 'var(--background-secondary)',
+                      borderRadius: '6px',
+                      borderLeft: '2px solid var(--interactive-accent)',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '6px',
+                    }}
+                  >
+                    <label
+                      style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', fontSize: '12px' }}
+                      title="仅展示直接反向关系与核心直系血亲/同门闭环（如兄弟共享父母、夫妻共享儿女）"
+                    >
+                      <input
+                        type="radio"
+                        name="listInferDisplayMode"
+                        checked={inferDisplayMode === 'partial'}
+                        onChange={() => setInferDisplayMode('partial')}
+                      />
+                      展示部分推算关系
+                    </label>
+                    <label
+                      style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', fontSize: '12px' }}
+                      title="展示包含跨代（祖孙/师祖）、旁系（叔伯/姑舅）与姻亲（嫂子/岳父母/大舅哥）在内的全部全局推算关系"
+                    >
+                      <input
+                        type="radio"
+                        name="listInferDisplayMode"
+                        checked={inferDisplayMode === 'all'}
+                        onChange={() => setInferDisplayMode('all')}
+                      />
+                      展示全部推算关系
+                    </label>
+                  </div>
+                )}
+
+                {/* 开启时间显示 */}
+                <label
+                  style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', marginTop: '6px', marginBottom: '14px' }}
+                  title="开启后在有时间范围的关系下方直接弱化显示时间；关闭时鼠标悬停在关系上可查看时间提示"
+                >
+                  <input type="checkbox" checked={listShowTime} onChange={(e) => setListShowTime(e.target.checked)} />
+                  开启时间显示
+                </label>
+
+                {/* 关系列默认宽度滑块（仅在未开启时间显示时生效，开启时间显示后自适应锁定为 168px） */}
+                <div style={{ paddingTop: '12px', borderTop: '1px solid var(--background-modifier-border)' }}>
+                  <label
+                    style={{
+                      display: 'block',
+                      color: listShowTime ? 'var(--text-muted)' : 'var(--text-normal)',
+                      fontSize: '12px',
+                      fontWeight: 500,
+                    }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                      <span>关系列默认宽度</span>
+                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                        {listShowTime ? '已自动适配 (168px)' : `${listColWidth}px`}
+                      </span>
                     </div>
-                    <select
-                      value={listSortMode}
-                      onChange={(e) => triggerSortWithLoading(e.target.value as ListSortMode)}
+                    <input
+                      type="range"
+                      min="60"
+                      max="260"
+                      step="4"
+                      disabled={listShowTime}
+                      value={listColWidth}
+                      onChange={(e) => setListColWidth(parseInt(e.target.value, 10))}
                       style={{
                         width: '100%',
-                        padding: '5px 8px',
-                        fontSize: '12px',
-                        background: 'var(--background-secondary)',
-                        color: 'var(--text-normal)',
-                        border: '1px solid var(--background-modifier-border)',
-                        borderRadius: '6px',
-                        cursor: 'pointer',
-                        outline: 'none',
+                        cursor: listShowTime ? 'not-allowed' : 'pointer',
+                        opacity: listShowTime ? 0.5 : 1,
                       }}
-                    >
-                      <option value="explorer">与文件管理器一致 (含 Flexplorer)</option>
-                      <option value="manual">手动拖拽排序 (自定义记忆)</option>
-                      <option value="name-asc">名称 (A - Z)</option>
-                      <option value="name-desc">名称 (Z - A)</option>
-                      <option value="mtime-desc">修改时间 (最新在前)</option>
-                      <option value="mtime-asc">修改时间 (最早在前)</option>
-                      <option value="ctime-desc">创建时间 (最新在前)</option>
-                      <option value="ctime-asc">创建时间 (最早在前)</option>
-                    </select>
-                    <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px', lineHeight: 1.4 }}>
-                      💡 直接上下拖拽表格最左侧人物行即可调整自定义顺序，顶部人物行将自动同步。
-                    </div>
-                  </div>
-
-                  {/* 开启推算关系 */}
-                  <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', marginBottom: '8px' }}>
-                    <input type="checkbox" checked={enableInferred} onChange={(e) => setEnableInferred(e.target.checked)} />
-                    开启推算关系
+                    />
                   </label>
-
-                  {enableInferred && (
-                    <div
-                      style={{
-                        marginTop: '6px',
-                        marginBottom: '10px',
-                        marginLeft: '18px',
-                        padding: '8px 10px',
-                        background: 'var(--background-secondary)',
-                        borderRadius: '6px',
-                        borderLeft: '2px solid var(--interactive-accent)',
-                        display: 'flex',
-                        flexDirection: 'column',
-                        gap: '6px',
-                      }}
-                    >
-                      <label
-                        style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', fontSize: '12px' }}
-                        title="仅展示直接反向关系与核心直系血亲/同门闭环（如兄弟共享父母、夫妻共享儿女）"
-                      >
-                        <input
-                          type="radio"
-                          name="listInferDisplayMode"
-                          checked={inferDisplayMode === 'partial'}
-                          onChange={() => setInferDisplayMode('partial')}
-                        />
-                        展示部分推算关系
-                      </label>
-                      <label
-                        style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', fontSize: '12px' }}
-                        title="展示包含跨代（祖孙/师祖）、旁系（叔伯/姑舅）与姻亲（嫂子/岳父母/大舅哥）在内的全部全局推算关系"
-                      >
-                        <input
-                          type="radio"
-                          name="listInferDisplayMode"
-                          checked={inferDisplayMode === 'all'}
-                          onChange={() => setInferDisplayMode('all')}
-                        />
-                        展示全部推算关系
-                      </label>
+                  {listShowTime && (
+                    <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px', lineHeight: 1.35 }}>
+                      💡 开启时间显示后，列宽已自动加宽以完整容纳时间范围；关闭「开启时间显示」后可自由调节。
                     </div>
                   )}
-
-                  {/* 开启时间显示 */}
-                  <label
-                    style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', marginTop: '6px' }}
-                    title="开启后在有时间范围的关系下方直接弱化显示时间；关闭时鼠标悬停在关系上可查看时间提示"
-                  >
-                    <input type="checkbox" checked={listShowTime} onChange={(e) => setListShowTime(e.target.checked)} />
-                    开启时间显示
-                  </label>
-                </Accordion>
+                </div>
               </div>
             )}
           </div>
