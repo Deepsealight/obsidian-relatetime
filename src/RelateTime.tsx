@@ -1,5 +1,22 @@
 import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react';
-import { Settings, Search, X, Plus, ChevronDown, ChevronRight, Calendar, ZoomIn, ZoomOut, RefreshCw, Sparkles, AlertTriangle, GripVertical, Clock } from 'lucide-react';
+import {
+  Settings,
+  Search,
+  X,
+  Plus,
+  ChevronDown,
+  ChevronRight,
+  Calendar,
+  ZoomIn,
+  ZoomOut,
+  RefreshCw,
+  Sparkles,
+  AlertTriangle,
+  GripVertical,
+  Clock,
+  HelpCircle,
+  Trash2,
+} from 'lucide-react';
 import { Notice, requestUrl } from 'obsidian';
 import * as d3 from 'd3';
 
@@ -25,6 +42,26 @@ type ListSortMode =
   | 'mtime-asc'
   | 'ctime-desc'
   | 'ctime-asc';
+
+type CustomEraMappingScope = 'entire' | 'valid_only';
+type GraphYearDisplayMode = 'standard' | 'custom';
+type ListYearDisplayMode = 'standard' | 'custom_first' | 'custom_first_with_standard' | 'custom_all';
+
+interface CustomEraItem {
+  id: string;
+  isStandard?: boolean;
+  enabled: boolean;
+  name: string;
+  startYear: number | '';
+  startMonth: number | '';
+  startDay: number | '';
+  startIsBC: boolean;
+  hasEnd: boolean;
+  endYear: number | '';
+  endMonth: number | '';
+  endDay: number | '';
+  endIsBC: boolean;
+}
 
 interface SemanticCacheEntry {
   category: string;
@@ -78,8 +115,35 @@ interface YMDState {
   isBC: boolean;
 }
 
+interface ParsedDateInfo {
+  year: number;
+  month: number;
+  day: number;
+  isBC: boolean;
+  timeSuffix: string;
+  decimalYear: number;
+}
+
 // 模块级持久化节点坐标缓存
 const GLOBAL_NODE_CACHE: Record<string, { x: number; y: number; vx: number; vy: number }> = {};
+
+const DEFAULT_ERA_ITEMS: CustomEraItem[] = [
+  {
+    id: 'standard',
+    isStandard: true,
+    enabled: true,
+    name: '标准时间',
+    startYear: 1,
+    startMonth: 1,
+    startDay: 1,
+    startIsBC: false,
+    hasEnd: false,
+    endYear: '',
+    endMonth: '',
+    endDay: '',
+    endIsBC: false,
+  },
+];
 
 // ---------------- 错误边界守护 ----------------
 export default class RelateTime extends React.Component<
@@ -117,8 +181,8 @@ export default class RelateTime extends React.Component<
   }
 }
 
-// ---------------- 折叠面板组件 ----------------
-const Accordion = ({ title, defaultOpen = true, children }: { title: string; defaultOpen?: boolean; children: React.ReactNode }) => {
+// ---------------- 折叠面板与问号提示组件 ----------------
+const Accordion = ({ title, defaultOpen = true, helpText, children }: { title: string; defaultOpen?: boolean; helpText?: string; children: React.ReactNode }) => {
   const [isOpen, setIsOpen] = useState(defaultOpen);
   return (
     <div style={{ marginBottom: '12px', borderBottom: '1px solid var(--background-modifier-border)', paddingBottom: '12px' }}>
@@ -128,13 +192,39 @@ const Accordion = ({ title, defaultOpen = true, children }: { title: string; def
       >
         {isOpen ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
         <span style={{ marginLeft: '4px' }}>{title}</span>
+        {helpText && (
+          <span
+            onClick={(e) => e.stopPropagation()}
+            style={{ display: 'inline-flex', alignItems: 'center', marginLeft: '5px', color: 'var(--text-muted)', cursor: 'help' }}
+            title={helpText}
+          >
+            <HelpCircle size={13} />
+          </span>
+        )}
       </div>
       {isOpen && <div style={{ marginTop: '10px', paddingLeft: '4px' }}>{children}</div>}
     </div>
   );
 };
 
-// ---------------- 日期、性别与强制语义归一化工具函数 ----------------
+const HelpIcon = ({ text }: { text: string }) => (
+  <span
+    style={{
+      display: 'inline-flex',
+      alignItems: 'center',
+      marginLeft: '5px',
+      color: 'var(--text-muted)',
+      cursor: 'help',
+      verticalAlign: 'middle',
+    }}
+    title={text}
+    onClick={(e) => e.stopPropagation()}
+  >
+    <HelpCircle size={13} />
+  </span>
+);
+
+// ---------------- 日期、自定义纪年与强制语义归一化工具函数 ----------------
 const MONTH_NAMES_ZH = ['1月', '2月', '3月', '4月', '5月', '6月', '7月', '8月', '9月', '10月', '11月', '12月'];
 const WEEK_NAMES_ZH = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
 const MONTH_DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
@@ -161,7 +251,6 @@ const extractAliases = (fm: any, displayName: string): string[] => {
     .filter((a: string) => a.length > 0 && a !== displayName);
 };
 
-// 深度递归提取任意插件配置对象（如 Flexplorer / Custom Sort）中的文件排序标识序列
 const extractOrderStringsFromObject = (obj: any, bucket: string[] = [], visited = new Set<any>()): string[] => {
   if (!obj || typeof obj !== 'object' || visited.has(obj)) return bucket;
   visited.add(obj);
@@ -190,7 +279,6 @@ const extractOrderStringsFromObject = (obj: any, bucket: string[] = [], visited 
   return bucket;
 };
 
-// 强制归一化语义类别
 const canonicalizeCategory = (label: string, rawCategory?: string): string => {
   const t = String(label || '').trim();
   if (/妻子|老婆|夫人|娘子|内人|爱人|伴侣|丈夫|老公|夫君|官人|相公|夫妻|配偶/.test(t)) return 'spouse';
@@ -227,6 +315,12 @@ const canonicalizeCategory = (label: string, rawCategory?: string): string => {
   ]);
   if (validStandard.has(rc)) return rc;
   return `custom_${t}`;
+};
+
+// 天文年份转换：公元前 1 年 (1 BC) 记为 0，公元前 2 年记为 -1，消除公元 0 年断层以保证跨 BC/AD 纪年差值准确
+const toAstroYear = (year: number, isBC: boolean): number => {
+  const y = Math.max(1, Math.abs(Math.floor(year || 1)));
+  return isBC ? -(y - 1) : y;
 };
 
 const ymdToDecimal = (ymd: YMDState): number => {
@@ -279,6 +373,111 @@ const parseDateToDecimal = (dateStr: string): number => {
   const fraction = (dayOfYear + (hr + min / 60) / 24) / 365;
 
   return (isBC ? -y : y) + fraction;
+};
+
+// 解析单端日期文本（提取年月日、BC 与时分秒后缀）
+const parseSingleDateDetail = (rawPart: string): ParsedDateInfo | null => {
+  if (!rawPart) return null;
+  const str = String(rawPart).trim();
+  if (!str) return null;
+
+  const isBC = /(BC|BCE|公元前)/i.test(str) || str.startsWith('-');
+  const timeMatch = str.match(/(\d{1,2}:\d{2}(?::\d{2})?)/);
+  const timeSuffix = timeMatch ? timeMatch[1]! : '';
+
+  const withoutTime = timeSuffix ? str.replace(timeSuffix, '').trim() : str;
+  const cleanStr = withoutTime.replace(/(BC|BCE|AD|CE|公元前|公元)/gi, '').trim();
+  const nums = cleanStr.match(/\d+/g) || [];
+  if (nums.length === 0) return null;
+
+  const year = Math.max(1, parseInt(nums[0] || '1', 10) || 1);
+  const month = nums.length > 1 ? Math.min(12, Math.max(1, parseInt(nums[1] || '1', 10))) : 1;
+  const maxDay = MONTH_DAYS[month - 1] || 31;
+  const day = nums.length > 2 ? Math.min(maxDay, Math.max(1, parseInt(nums[2] || '1', 10))) : 1;
+
+  return {
+    year,
+    month,
+    day,
+    isBC,
+    timeSuffix,
+    decimalYear: parseDateToDecimal(str),
+  };
+};
+
+// 校验自定义纪年项是否具备完整合法的起始年月日及名称
+const isCustomEraValid = (item: CustomEraItem): boolean => {
+  if (item.isStandard) return true;
+  if (!item.name || !item.name.trim()) return false;
+  const sy = Number(item.startYear);
+  const sm = Number(item.startMonth);
+  const sd = Number(item.startDay);
+  if (!Number.isFinite(sy) || sy < 1) return false;
+  if (!Number.isFinite(sm) || sm < 1 || sm > 12) return false;
+  const maxStartD = MONTH_DAYS[sm - 1] || 31;
+  if (!Number.isFinite(sd) || sd < 1 || sd > maxStartD) return false;
+  return true;
+};
+
+// 检查自定义纪年的结束时间是否完整有效
+const hasValidEndYMD = (item: CustomEraItem): boolean => {
+  if (!item.hasEnd) return false;
+  const ey = Number(item.endYear);
+  const em = Number(item.endMonth);
+  const ed = Number(item.endDay);
+  if (!Number.isFinite(ey) || ey < 1) return false;
+  if (!Number.isFinite(em) || em < 1 || em > 12) return false;
+  const maxEndD = MONTH_DAYS[em - 1] || 31;
+  if (!Number.isFinite(ed) || ed < 1 || ed > maxEndD) return false;
+  return true;
+};
+
+// 判断目标日期在指定纪年项下是否生效，并返回换算后的年份文本（如 "民国32年" 或 "2021年"）
+const resolveEraYearLabelForDate = (
+  item: CustomEraItem,
+  targetDecimal: number,
+  targetDisplayYear: number,
+  targetIsBC: boolean,
+  mappingScope: CustomEraMappingScope
+): string | null => {
+  if (!item.enabled) return null;
+  if (item.isStandard) {
+    return targetIsBC ? `${targetDisplayYear} BC` : `${targetDisplayYear}年`;
+  }
+  if (!isCustomEraValid(item)) return null;
+
+  const startDec = ymdToDecimal({
+    year: Number(item.startYear),
+    month: Number(item.startMonth),
+    day: Number(item.startDay),
+    isBC: item.startIsBC,
+  });
+
+  // 无论映射模式是“整个时间轴”还是“仅有效范围”，在起始时间之前一律不显示
+  if (targetDecimal < startDec - 1e-6) {
+    return null;
+  }
+
+  // 若选择“自定义时间仅映射有效范围”，且配置了有效的结束时间，则超出结束时间后不显示
+  if (mappingScope === 'valid_only' && hasValidEndYMD(item)) {
+    const endDec = ymdToDecimal({
+      year: Number(item.endYear),
+      month: Number(item.endMonth),
+      day: Number(item.endDay),
+      isBC: item.endIsBC,
+    });
+    // 结束时间当天全天均视为有效（加上 1 天的十进制余量）
+    if (targetDecimal > endDec + 1 / 365 + 1e-6) {
+      return null;
+    }
+  }
+
+  const startAstro = toAstroYear(Number(item.startYear), item.startIsBC);
+  const targetAstro = toAstroYear(targetDisplayYear, targetIsBC);
+  const eraYearNum = targetAstro - startAstro + 1;
+  if (eraYearNum <= 0) return null;
+
+  return `${item.name.trim()}${eraYearNum}年`;
 };
 
 const isTimeStrActive = (timeStr: string, currentYear: number): boolean => {
@@ -334,13 +533,94 @@ const decomposeDecimalYear = (dec: number) => {
   };
 };
 
-const formatCurrentTimeBadge = (dec: number, span: number): string => {
-  const info = decomposeDecimalYear(dec);
-  const yearLabel = info.isBC ? `${info.displayYear} BC` : `${info.displayYear}年`;
-  if (span > 20) return `${yearLabel} ${info.monthIndex + 1}月`;
-  if (span > 0.5) return `${yearLabel} ${info.monthIndex + 1}月 ${info.day}日`;
+// 根据给定年份称号（如 "57 BC"、"2026年" 或 "民国82年"）和视图跨度生成时间轴胶囊文本
+const formatBadgeWithYearPrefix = (yearPrefix: string, info: ReturnType<typeof decomposeDecimalYear>, span: number): string => {
+  if (span > 20) return `${yearPrefix} ${info.monthIndex + 1}月`;
+  if (span > 0.5) return `${yearPrefix} ${info.monthIndex + 1}月 ${info.day}日`;
   const pad = (n: number) => String(n).padStart(2, '0');
-  return `${yearLabel} ${info.monthIndex + 1}月 ${info.day}日 ${pad(info.hour)}:${pad(info.minute)}`;
+  return `${yearPrefix} ${info.monthIndex + 1}月 ${info.day}日 ${pad(info.hour)}:${pad(info.minute)}`;
+};
+
+// 格式化列表视图与悬浮层中的单端日期
+const formatListSingleDate = (
+  rawDatePart: string,
+  listYearMode: ListYearDisplayMode,
+  eraItems: CustomEraItem[],
+  mappingScope: CustomEraMappingScope
+): string => {
+  const info = parseSingleDateDetail(rawDatePart);
+  if (!info) return rawDatePart.trim();
+
+  const stdYearStr = info.isBC ? `${info.year} BC` : `${info.year}年`;
+  const mdTimeStr = `${info.month}月${info.day}日${info.timeSuffix ? ` ${info.timeSuffix}` : ''}`;
+
+  // 1. 标准年份：2021年8月26日 17:00:00
+  if (listYearMode === 'standard') {
+    return `${stdYearStr}${mdTimeStr}`;
+  }
+
+  // 2. 自定义年份（1个）：按排序仅展示第 1 个生效的自定义年份；若无生效项则回退标准年份
+  if (listYearMode === 'custom_first') {
+    for (const item of eraItems) {
+      if (item.isStandard) continue;
+      const lbl = resolveEraYearLabelForDate(item, info.decimalYear, info.year, info.isBC, mappingScope);
+      if (lbl) {
+        return `${lbl}${mdTimeStr}`;
+      }
+    }
+    return `${stdYearStr}${mdTimeStr}`;
+  }
+
+  // 3. 自定义年份（1个）+ 标准年份：如 "民国32年8月26日 17:00:00 (2021年)"；若不在自定义年份生效范围内则显示 "2026年4月12日"
+  if (listYearMode === 'custom_first_with_standard') {
+    for (const item of eraItems) {
+      if (item.isStandard) continue;
+      const lbl = resolveEraYearLabelForDate(item, info.decimalYear, info.year, info.isBC, mappingScope);
+      if (lbl) {
+        return `${lbl}${mdTimeStr} (${stdYearStr})`;
+      }
+    }
+    return `${stdYearStr}${mdTimeStr}`;
+  }
+
+  // 4. 自定义年份（全部）：完全按照包含“标准时间”在内的拖拽排序顺序，第 1 个作为主干，其余放进括号并用中文逗号隔开
+  const activeYearLabels: string[] = [];
+  for (const item of eraItems) {
+    const lbl = resolveEraYearLabelForDate(item, info.decimalYear, info.year, info.isBC, mappingScope);
+    if (lbl) {
+      activeYearLabels.push(lbl);
+    }
+  }
+
+  if (activeYearLabels.length === 0) {
+    return `${stdYearStr}${mdTimeStr}`;
+  }
+  const primaryYear = activeYearLabels[0]!;
+  const extraYears = activeYearLabels.slice(1);
+  if (extraYears.length === 0) {
+    return `${primaryYear}${mdTimeStr}`;
+  }
+  return `${primaryYear}${mdTimeStr} (${extraYears.join('，')})`;
+};
+
+// 格式化列表视图与悬浮层中的完整时间范围字符串
+const formatListTimeRangeStr = (
+  timeStr: string,
+  listYearMode: ListYearDisplayMode,
+  eraItems: CustomEraItem[],
+  mappingScope: CustomEraMappingScope
+): string => {
+  if (!timeStr) return '';
+  const trimmed = timeStr.trim();
+  if (!trimmed || trimmed === '固定') return trimmed;
+
+  const parts = trimmed.split(/\s*[～~]\s*/);
+  if (parts.length >= 2) {
+    const leftFormatted = formatListSingleDate(parts[0] || '', listYearMode, eraItems, mappingScope);
+    const rightFormatted = formatListSingleDate(parts.slice(1).join(' ~ '), listYearMode, eraItems, mappingScope);
+    return `${leftFormatted} ~ ${rightFormatted}`;
+  }
+  return formatListSingleDate(trimmed, listYearMode, eraItems, mappingScope);
 };
 
 // ---------------- 本地确定性性别冲突检测 + 语义归类与反向推算引擎 ----------------
@@ -489,6 +769,35 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
   const [draggedRowId, setDraggedRowId] = useState<string | null>(null);
   const [dragOverRowId, setDragOverRowId] = useState<string | null>(null);
 
+  // 自定义时间映射状态
+  const [customEraItems, setCustomEraItems] = useState<CustomEraItem[]>(() => {
+    const savedList = savedUi.customEraItems;
+    if (Array.isArray(savedList) && savedList.length > 0) {
+      const hasStandard = savedList.some((it: CustomEraItem) => it.isStandard || it.id === 'standard');
+      const normalized = savedList.map((it: CustomEraItem) =>
+        it.isStandard || it.id === 'standard'
+          ? { ...it, id: 'standard', isStandard: true, enabled: true, name: '标准时间' }
+          : it
+      );
+      return hasStandard ? normalized : [DEFAULT_ERA_ITEMS[0]!, ...normalized];
+    }
+    return DEFAULT_ERA_ITEMS;
+  });
+  const [customEraMappingScope, setCustomEraMappingScope] = useState<CustomEraMappingScope>(
+    () => savedUi.customEraMappingScope ?? 'entire'
+  );
+  const [graphYearDisplayMode, setGraphYearDisplayMode] = useState<GraphYearDisplayMode>(
+    () => savedUi.graphYearDisplayMode ?? 'custom'
+  );
+  const [listYearDisplayMode, setListYearDisplayMode] = useState<ListYearDisplayMode>(
+    () => savedUi.listYearDisplayMode ?? 'custom_first'
+  );
+
+  // 自定义时间映射项拖拽排序状态与删除按钮悬停状态
+  const [draggedEraId, setDraggedEraId] = useState<string | null>(null);
+  const [dragOverEraId, setDragOverEraId] = useState<string | null>(null);
+  const [hoveredDeleteEraId, setHoveredDeleteEraId] = useState<string | null>(null);
+
   // 列表列宽控制：第一列支持鼠标拖拽缩放，其余列在未开启时间显示时由滑块控制，开启时间显示时固定为 168px
   const [firstColWidth, setFirstColWidth] = useState<number>(() => savedUi.firstColWidth ?? 196);
   const [listColWidth, setListColWidth] = useState<number>(() => savedUi.listColWidth ?? 120);
@@ -542,7 +851,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     return plugin?.settings?.llmCache?.semanticMap || {};
   });
   const [llmGlobalInferred, setLlmGlobalInferred] = useState<GlobalInferredRecord[]>(() => {
-    return Array.isArray(plugin?.settings?.llmCache?.globalInferred) ? plugin.settings.llmCache.globalInferred : [];
+    return Array.isArray(plugin?.settings?.llmCache?.globalInferred) ? plugin.settings.llmCache?.globalInferred : [];
   });
   const [llmLoading, setLlmLoading] = useState(false);
   const [llmStepText, setLlmStepText] = useState('');
@@ -608,7 +917,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
   const minRangeDecimal = useMemo(() => ymdToDecimal(startYMD), [startYMD]);
   const maxRangeDecimal = useMemo(() => Math.max(minRangeDecimal + 0.01, ymdToDecimal(endYMD)), [endYMD, minRangeDecimal]);
 
-  // 计算相对于 workspaceRootRef 的精准鼠标坐标，彻底解决容器偏移导致 Tooltip 离鼠标太远的问题
+  // 计算相对于 workspaceRootRef 的精准鼠标坐标
   const getRelativeMousePos = useCallback((clientX: number, clientY: number) => {
     const rect = workspaceRootRef.current?.getBoundingClientRect();
     if (!rect) return { x: clientX + 12, y: clientY + 12 };
@@ -618,9 +927,10 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     };
   }, []);
 
-  // 自动持久化保存所有图谱与列表 UI 设置（含 customManualOrder 与 listSortMode）
+  // 自动持久化保存所有图谱与列表 UI 设置（对于自定义时间映射，仅保存填写了合法起始时间的项）
   useEffect(() => {
     if (!plugin || !plugin.settings) return;
+    const validCustomErasToSave = customEraItems.filter((item) => item.isStandard || isCustomEraValid(item));
     const nextUiState = {
       viewMode,
       listSearchQuery,
@@ -630,6 +940,10 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       customManualOrder,
       firstColWidth,
       listColWidth,
+      customEraItems: validCustomErasToSave,
+      customEraMappingScope,
+      graphYearDisplayMode,
+      listYearDisplayMode,
       isPanelOpen,
       searchQuery,
       showIsolated,
@@ -672,6 +986,10 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     customManualOrder,
     firstColWidth,
     listColWidth,
+    customEraItems,
+    customEraMappingScope,
+    graphYearDisplayMode,
+    listYearDisplayMode,
     isPanelOpen,
     searchQuery,
     showIsolated,
@@ -698,14 +1016,73 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     jumpYMD,
   ]);
 
-  // 三级穿透读取“与文件管理器一致（含 Flexplorer 自定义排序）”，无需打开左侧边栏即可生效
+  // 自定义时间映射项拖拽排序处理
+  const handleEraDrop = useCallback(
+    (targetId: string) => {
+      if (!draggedEraId || draggedEraId === targetId) {
+        setDraggedEraId(null);
+        setDragOverEraId(null);
+        return;
+      }
+      setCustomEraItems((prev) => {
+        const fromIdx = prev.findIndex((it) => it.id === draggedEraId);
+        const toIdx = prev.findIndex((it) => it.id === targetId);
+        if (fromIdx === -1 || toIdx === -1) return prev;
+        const next = [...prev];
+        const [moved] = next.splice(fromIdx, 1);
+        if (moved) {
+          next.splice(toIdx, 0, moved);
+        }
+        return next;
+      });
+      setDraggedEraId(null);
+      setDragOverEraId(null);
+    },
+    [draggedEraId]
+  );
+
+  // 计算图谱底部时间轴中央胶囊展示内容（第 1 行主胶囊 + 第 2 行副胶囊）
+  const timelineCenterBadges = useMemo(() => {
+    const info = decomposeDecimalYear(currentYear);
+    const stdYearPrefix = info.isBC ? `${info.displayYear} BC` : `${info.displayYear}年`;
+
+    if (graphYearDisplayMode === 'standard') {
+      return {
+        primaryText: formatBadgeWithYearPrefix(stdYearPrefix, info, viewSpan),
+        secondaryText: '',
+      };
+    }
+
+    const activeYearLabels: string[] = [];
+    for (const item of customEraItems) {
+      const lbl = resolveEraYearLabelForDate(item, currentYear, info.displayYear, info.isBC, customEraMappingScope);
+      if (lbl) {
+        activeYearLabels.push(lbl);
+      }
+    }
+
+    if (activeYearLabels.length === 0) {
+      return {
+        primaryText: formatBadgeWithYearPrefix(stdYearPrefix, info, viewSpan),
+        secondaryText: '',
+      };
+    }
+
+    const firstYearPrefix = activeYearLabels[0]!;
+    const restYears = activeYearLabels.slice(1);
+    return {
+      primaryText: formatBadgeWithYearPrefix(firstYearPrefix, info, viewSpan),
+      secondaryText: restYears.join('，'),
+    };
+  }, [currentYear, viewSpan, graphYearDisplayMode, customEraItems, customEraMappingScope]);
+
+  // 三级穿透读取“与文件管理器一致（含 Flexplorer 自定义排序）”
   const syncExplorerOrder = useCallback(async () => {
     if (!plugin?.app) return;
     const app = plugin.app;
     const tokens: string[] = [];
 
     try {
-      // 第一级：直接穿透读取已加载的 Flexplorer / Custom Sort 插件内存配置
       const customPlugins = ['flexplorer', 'custom-frames', 'sort-and-permute-files', 'custom-sort'];
       const loadedPlugins = (app as any).plugins?.plugins || {};
       for (const pid of customPlugins) {
@@ -715,7 +1092,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
         }
       }
 
-      // 第二级：直接从本地磁盘读取 .obsidian/plugins/flexplorer/data.json（即使插件未暴露内存或边栏关闭也 100% 读到）
       const configDir = app.vault.configDir || '.obsidian';
       const flexDataPath = `${configDir}/plugins/flexplorer/data.json`;
       if (await app.vault.adapter.exists(flexDataPath)) {
@@ -724,7 +1100,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
         extractOrderStringsFromObject(parsed, tokens);
       }
 
-      // 第三级：如果 file-explorer 视图存在，补充读取其树状顺序及 DOM 顺序
       const explorerLeaves = app.workspace.getLeavesOfType('file-explorer');
       if (explorerLeaves.length > 0) {
         const view: any = explorerLeaves[0]?.view;
@@ -740,7 +1115,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
         }
       }
 
-      // 读取 Obsidian 原生文件管理器排序规则作为兜底
       const nativeSort = (app.vault as any).getConfig?.('fileSortOrder') || 'alphabetical';
       setNativeSortRule(String(nativeSort));
     } catch (e) {
@@ -751,16 +1125,10 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
   }, [plugin]);
 
   useEffect(() => {
-    // 初始和依赖变化时同步一次
     syncExplorerOrder();
-    
     if (!plugin || !plugin.app) return;
-    
-    // 监听文件系统变动（应对 Flexplorer 排序文件更新）
     const handleChange = () => syncExplorerOrder();
     const eventRef = plugin.app.vault.on('modify', handleChange);
-    
-    // 监听焦点变化（应对拖拽操作结束）
     const layoutRef = plugin.app.workspace.on('layout-change', handleChange);
 
     return () => {
@@ -769,7 +1137,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     };
   }, [syncExplorerOrder, rawFiles, listSortMode, viewMode, plugin]);
 
-  // 触发带短暂 Loading 反馈的排序切换函数
   const triggerSortWithLoading = useCallback((nextMode: ListSortMode) => {
     setIsSortingList(true);
     setListSortMode(nextMode);
@@ -2466,14 +2833,13 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       });
     svg.call(zoom);
 
-    // 计算对齐 Obsidian 原生手感的物理参数
     const effectiveDistance = Math.max(25, linkDistance * (1.35 - linkAttractStrength * 0.85));
     const effectiveLinkStrength = 0.08 + Math.pow(linkAttractStrength, 1.3) * 0.85;
     const effectiveRepel = -(Math.max(15, repelStrength * 1.8));
 
     const sim = d3
       .forceSimulation<NodeData, LinkData>()
-      .velocityDecay(0.32) // 降低阻尼，让拖拽滑块时节点像 Obsidian 原生图谱一样丝滑游动
+      .velocityDecay(0.32)
       .force(
         'link',
         d3
@@ -2486,7 +2852,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       .force('x', d3.forceX<NodeData>(width / 2).strength(Math.pow(centerStrength, 1.2) * 0.45))
       .force('y', d3.forceY<NodeData>(height / 2).strength(Math.pow(centerStrength, 1.2) * 0.45))
       .force('collide', d3.forceCollide<NodeData>().radius(nodeSize + 14).iterations(2))
-      .alphaDecay(0.022) // 延长物理收敛时间，让滑块实时反馈更明显
+      .alphaDecay(0.022)
       .on('tick', () => {
         updateGraphPositions();
       });
@@ -2689,25 +3055,21 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     const width = svgRef.current.clientWidth || 800;
     const height = svgRef.current.clientHeight || 600;
 
-    // 1. 吸引力与连线长度联动：吸引力越大，不仅拉力越强，还会主动收缩目标间距，实现真正的“拉近相连节点”
     const effectiveDistance = Math.max(25, linkDistance * (1.35 - linkAttractStrength * 0.85));
     const effectiveLinkStrength = 0.08 + Math.pow(linkAttractStrength, 1.3) * 0.85;
 
     const linkForce = sim.force('link') as d3.ForceLink<NodeData, LinkData>;
     if (linkForce) {
       linkForce.distance(effectiveDistance).strength(effectiveLinkStrength);
-      // 关键：重新绑定 links 以强制 D3 刷新每个连接的内部缓存参数
       linkForce.links(simLinksRef.current);
     }
 
-    // 2. 排斥力：放大响应曲线，且即使滑到 0 也保留微弱的 -15 防重叠力，保证调节吸引力时永远有对抗力可拉扯
     const effectiveRepel = -(Math.max(15, repelStrength * 1.8));
     const chargeForce = sim.force('charge') as d3.ForceManyBody<NodeData>;
     if (chargeForce) {
       chargeForce.strength(effectiveRepel).distanceMax(1200);
     }
 
-    // 3. 向心力：当设为 0 时完全释放，调大时平滑向画布中心聚拢
     const effectiveCenter = Math.pow(centerStrength, 1.2) * 0.45;
     const forceX = sim.force('x') as d3.ForceX<NodeData>;
     if (forceX) {
@@ -2726,7 +3088,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
 
     updateGraphPositions();
     applyVisualStyles();
-    // 给予充足的 alpha 动能（0.75），让拖动滑块时图谱立即产生肉眼可见的聚拢/散开动画
     sim.alpha(0.75).restart();
   }, [centerStrength, repelStrength, linkAttractStrength, linkDistance, nodeSize, updateGraphPositions, applyVisualStyles]);
 
@@ -2758,7 +3119,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     const secondaryTicks: { pos: number; label: string; isMajor?: boolean }[] = [];
 
     const toPx = (val: number) => ((val - startVal) / viewSpan) * timelineWidth;
-    // 严格判断刻度值是否在用户设置的 [起始时间, 结束时间] 范围内（附带极小浮点容差）
     const isInRange = (val: number) => val >= minRangeDecimal - 1e-6 && val <= maxRangeDecimal + 1e-6;
 
     const formatYearZh = (y: number, withSuffix = true) => {
@@ -2983,7 +3343,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       return list.sort((a, b) => a.ctime - b.ctime || collator.compare(a.label, b.label));
     }
 
-    // 手动拖拽排序（自定义顺序）：严格读取持久化的 customManualOrder，切回时 100% 还原上次手动排序
     if (listSortMode === 'manual') {
       if (customManualOrder.length === 0) {
         return list.sort((a, b) => collator.compare(a.label, b.label));
@@ -2998,7 +3357,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       });
     }
 
-    // 与文件管理器一致（穿透支持 Flexplorer + 原生排序规则回退）
     if (explorerOrderTokens.length > 0) {
       const getTokenRank = (node: NodeData): number => {
         const candidates = [node.path, `${node.id}.md`, node.id, node.label];
@@ -3027,7 +3385,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       }
     }
 
-    // 若未配置 Flexplorer 顺序，则按 Obsidian 原生文件管理器排序规则排列
     if (nativeSortRule === 'alphabeticalReverse') {
       return list.sort((a, b) => collator.compare(b.realName, a.realName));
     }
@@ -3046,7 +3403,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     return list.sort((a, b) => collator.compare(a.realName, b.realName));
   }, [allCharacterNodes, listSortMode, customManualOrder, explorerOrderTokens, nativeSortRule]);
 
-  // 列表视图左侧行筛选：基于排好序的 sortedCharacterNodes 过滤左侧行，顶部列始终保持完整排好序的 sortedCharacterNodes
   const filteredListRows = useMemo(() => {
     const q = listSearchQuery.trim().toLowerCase();
     if (!q) return sortedCharacterNodes;
@@ -3072,7 +3428,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
     });
   }, [sortedCharacterNodes, fullTimeMatrixMap, listSearchQuery, listSearchScope]);
 
-  // 处理左侧人物拖拽排序完成：更新 customManualOrder，自动切换到 'manual' 模式，并同步刷新顶部行与左侧列
   const handleRowDrop = useCallback(
     (targetRowId: string) => {
       if (!draggedRowId || draggedRowId === targetRowId) {
@@ -3086,8 +3441,8 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
       const toIdx = baseOrder.indexOf(targetRowId);
 
       if (fromIdx !== -1 && toIdx !== -1) {
-        setIsSortingList(true); 
-        
+        setIsSortingList(true);
+
         requestAnimationFrame(() => {
           setTimeout(() => {
             const nextOrder = [...baseOrder];
@@ -3095,14 +3450,14 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
             if (moved) {
               nextOrder.splice(toIdx, 0, moved);
             }
-            
+
             if (listSortMode !== 'manual') {
-               setListSortMode('manual');
+              setListSortMode('manual');
             }
             setCustomManualOrder(nextOrder);
-            
+
             setIsSortingList(false);
-          }, 10); 
+          }, 10);
         });
       }
 
@@ -3115,7 +3470,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
   const highlightCharInList = listSearchQuery.trim() !== '' && (listSearchScope === 'all' || listSearchScope === 'character');
   const highlightRelInList = listSearchQuery.trim() !== '' && (listSearchScope === 'all' || listSearchScope === 'relation');
 
-  // 100% 不透明实色背景定义（彻底解决 sticky 固定列与固定表头在滚动时半透明高亮块穿模重叠的问题）
+  // 100% 不透明实色背景定义
   const solidHeaderBg = 'var(--background-secondary)';
   const solidHeaderHighlightBg = 'color-mix(in srgb, var(--interactive-accent) 16%, var(--background-secondary))';
   const solidRowBg = 'var(--background-primary)';
@@ -3123,13 +3478,18 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
   const solidCrosshairCellBg = 'color-mix(in srgb, var(--interactive-accent) 10%, var(--background-primary))';
   const solidSelectedCellBg = 'color-mix(in srgb, var(--interactive-accent) 20%, var(--background-primary))';
 
+  // 更新单条自定义时间映射项的辅助函数
+  const updateCustomEraItem = (id: string, patch: Partial<CustomEraItem>) => {
+    setCustomEraItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...patch } : it)));
+  };
+
   return (
     <div
       ref={workspaceRootRef}
       style={{ position: 'relative', width: '100%', height: '100%', background: 'transparent', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}
     >
       <div style={{ position: 'relative', flex: 1, width: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-        {/* 红色冲突连线悬浮 Tooltip 层（基于 workspaceRootRef 精准相对定位，紧贴鼠标） */}
+        {/* 红色冲突连线悬浮 Tooltip 层 */}
         {conflictTooltip.visible && (
           <div
             style={{
@@ -3156,7 +3516,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
           </div>
         )}
 
-        {/* 列表视图：关闭时间显示时的悬停时间范围 Tooltip（基于 workspaceRootRef 精准相对定位，紧贴鼠标） */}
+        {/* 列表视图：关闭时间显示时的悬停时间范围 Tooltip */}
         {timeTooltip.visible && (
           <div
             style={{
@@ -3199,12 +3559,12 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
               alignItems: 'center',
               gap: '4px',
               padding: '3px',
-              background: 'rgba(255, 255, 255, 0.1)', // 半透明背景底色
-              backdropFilter: 'blur(12px)', // 毛玻璃模糊效果
-              WebkitBackdropFilter: 'blur(12px)', // 兼容 Safari
-              border: '1px solid rgba(255, 255, 255, 0.7)', // 微妙的半透明边框
-              borderRadius: '20px', // 更圆润的整体外框
-              boxShadow: '0 4px 12px rgba(0, 0, 0, 0.03), inset 0 1px 0 rgba(255, 255, 255, 0.2)', // 增加内发光和外阴影增加立体感
+              background: 'rgba(255, 255, 255, 0.1)',
+              backdropFilter: 'blur(12px)',
+              WebkitBackdropFilter: 'blur(12px)',
+              border: '1px solid rgba(255, 255, 255, 0.7)',
+              borderRadius: '20px',
+              boxShadow: '0 4px 12px rgba(0, 0, 0, 0.03), inset 0 1px 0 rgba(255, 255, 255, 0.2)',
             }}
           >
             <button
@@ -3213,14 +3573,13 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                 padding: '4px 20px',
                 fontSize: '12px',
                 fontWeight: viewMode === 'graph' ? 600 : 500,
-                borderRadius: '16px', // 内部按钮也更圆润
+                borderRadius: '16px',
                 border: 'none',
                 cursor: 'pointer',
-                // 选中时使用带有透明度的强调色并带有微小阴影，未选中完全透明
                 background: viewMode === 'graph' ? 'color-mix(in srgb, var(--interactive-accent) 90%, transparent)' : 'transparent',
                 color: viewMode === 'graph' ? 'var(--text-on-accent)' : 'var(--text-muted)',
                 boxShadow: viewMode === 'graph' ? '0 2px 6px rgba(0,0,0,0.15)' : 'none',
-                transition: 'all 0.2s cubic-bezier(0.25, 0.1, 0.25, 1)', // 更平滑的过渡
+                transition: 'all 0.2s cubic-bezier(0.25, 0.1, 0.25, 1)',
               }}
             >
               图谱
@@ -3417,28 +3776,25 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                     borderCollapse: 'separate',
                     borderSpacing: 0,
                     width: '100%',
-                    height: '100%', // 让表格高度撑满外框，以便最后一行把第一列竖线延伸到底部
+                    height: '100%',
                     tableLayout: 'fixed',
                     fontSize: '12px',
                     userSelect: 'none',
                   }}
                 >
                   <colgroup>
-                    {/* 第一列：严格锁死拖拽宽度 */}
                     <col style={{ width: `${firstColWidth}px`, minWidth: `${firstColWidth}px`, maxWidth: `${firstColWidth}px` }} />
-                    {/* 关系列：严格锁死滑块宽度 */}
                     {sortedCharacterNodes.map((colNode) => (
                       <col
                         key={`col-def-${colNode.id}`}
                         style={{ width: `${effectiveColWidth}px`, minWidth: `${effectiveColWidth}px`, maxWidth: `${effectiveColWidth}px` }}
                       />
                     ))}
-                    {/* 右侧弹性占位尾列：不设固定宽，专门吸收右侧剩余空白，绝不挤压前面的列 */}
                     <col style={{ width: 'auto' }} />
                   </colgroup>
                   <thead>
                     <tr>
-                      {/* 左上角固定交叉表头（Z-index 最高，纯实色背景防穿透） */}
+                      {/* 左上角固定交叉表头 */}
                       <th
                         style={{
                           position: 'sticky',
@@ -3505,7 +3861,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                               width: `${effectiveColWidth}px`,
                               minWidth: `${effectiveColWidth}px`,
                               maxWidth: `${effectiveColWidth}px`,
-                              minHeight: '46px', // 修改点：取消固定 height，文字换行时自动撑高
+                              minHeight: '46px',
                               padding: '6px 10px',
                               boxSizing: 'border-box',
                               background: isColHighlighted ? solidHeaderHighlightBg : solidHeaderBg,
@@ -3518,7 +3874,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                             }}
                             title={fullTitle}
                           >
-                            {/* 外层容器负责居中对齐 */}
                             <div
                               style={{
                                 display: 'flex',
@@ -3526,7 +3881,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                                 width: '100%',
                               }}
                             >
-                              {/* 内层容器负责多行左对齐和截断 */}
                               <div
                                 style={{
                                   display: '-webkit-box',
@@ -3537,7 +3891,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                                   whiteSpace: 'normal',
                                   lineHeight: 1.3,
                                   color: 'var(--text-muted)',
-                                  textAlign: 'left', // 强制左对齐，单行时受外层 flex-center 影响依然居中
+                                  textAlign: 'left',
                                 }}
                               >
                                 <span
@@ -3566,7 +3920,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                           </th>
                         );
                       })}
-                      {/* 顶部表头右侧延伸占位列：保持表头背景色与底边横线贯通至最右端 */}
+                      {/* 顶部表头右侧延伸占位列 */}
                       <th
                         style={{
                           position: 'sticky',
@@ -3590,7 +3944,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
 
                       return (
                         <tr key={`row-${rowNode.id}`}>
-                          {/* 最左侧一列：支持拖拽排序、点击整行高亮、Command+单击打开文件；100% 纯实色背景彻底杜绝滚动重叠 */}
+                          {/* 最左侧一列 */}
                           <td
                             draggable
                             onMouseEnter={() => {
@@ -3667,40 +4021,37 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                             title="点击高亮整行 | 拖拽可自定义排序 | 按住 Command/Ctrl 单击打开笔记"
                           >
                             <div style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: '6px', width: '100%', overflow: 'hidden' }}>
-                              {/* 拖拽手柄区域：使用绝对定位和渐变背景遮挡下方文字 */}
                               <div
                                 style={{
                                   position: 'absolute',
                                   left: 0,
                                   top: 0,
                                   bottom: 0,
-                                  width: '28px', // 渐变区域宽度
+                                  width: '28px',
                                   display: 'flex',
                                   alignItems: 'center',
-                                  // 使用 solidRowHighlightBg 保证选中状态下渐变色与底色完美融合
-                                  background: isRowHighlighted 
-                                    ? `linear-gradient(to right, ${solidRowHighlightBg} 60%, transparent)` 
+                                  background: isRowHighlighted
+                                    ? `linear-gradient(to right, ${solidRowHighlightBg} 60%, transparent)`
                                     : `linear-gradient(to right, ${solidRowBg} 60%, transparent)`,
                                   opacity: hoveredRowIdForDrag === rowNode.id || draggedRowId === rowNode.id ? 1 : 0,
                                   transition: 'opacity 0.2s ease',
                                   pointerEvents: hoveredRowIdForDrag === rowNode.id || draggedRowId === rowNode.id ? 'auto' : 'none',
-                                  zIndex: 2, // 确保在文字上方
+                                  zIndex: 2,
                                 }}
                               >
                                 <GripVertical
                                   size={13}
                                   color="var(--text-faint)"
-                                  style={{ 
-                                    cursor: 'grab', 
-                                    marginLeft: '-2px', // 微调图标位置
+                                  style={{
+                                    cursor: 'grab',
+                                    marginLeft: '-2px',
                                   }}
                                 />
                               </div>
-                              
-                              {/* 圆球：固定位置，为了给手柄留出视觉空间，适当调整 margin */}
+
                               <span
                                 style={{
-                                  marginLeft: '4px', 
+                                  marginLeft: '4px',
                                   width: '9px',
                                   height: '9px',
                                   borderRadius: '50%',
@@ -3710,12 +4061,11 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                                   zIndex: 1,
                                 }}
                               />
-                              
-                              {/* 名字与别名容器：别名另起一行，使用 Flex 列布局 */}
+
                               <div
                                 style={{
-                                  display: 'flex', 
-                                  flexDirection: 'column', 
+                                  display: 'flex',
+                                  flexDirection: 'column',
                                   justifyContent: 'center',
                                   flex: 1,
                                   minWidth: 0,
@@ -3739,7 +4089,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                                 {aliasStr && (
                                   <span
                                     style={{
-                                      marginTop: '2px', // 别名在名字下方
+                                      marginTop: '2px',
                                       fontSize: '11px',
                                       color: 'var(--text-muted)',
                                       opacity: 0.75,
@@ -3778,7 +4128,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                             />
                           </td>
 
-                          {/* 中间关系区域：列宽 144px、最小行高 56px */}
+                          {/* 中间关系区域 */}
                           {sortedCharacterNodes.map((colNode) => {
                             const isDiagonal = rowNode.id === colNode.id;
                             const cellEdges = isDiagonal
@@ -3859,6 +4209,14 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                                         edge.label.toLowerCase().includes(listSearchQuery.trim().toLowerCase());
 
                                       const showTimeBlock = listShowTime && hasTimeRange;
+                                      const formattedEdgeTime = hasTimeRange
+                                        ? formatListTimeRangeStr(
+                                            edge.timeStr,
+                                            listYearDisplayMode,
+                                            customEraItems,
+                                            customEraMappingScope
+                                          )
+                                        : edge.timeStr;
 
                                       return (
                                         <div
@@ -3879,7 +4237,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                                                 visible: true,
                                                 x: pos.x,
                                                 y: pos.y,
-                                                text: edge.timeStr,
+                                                text: formattedEdgeTime,
                                               });
                                             }
                                           }}
@@ -3916,16 +4274,16 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                                             gap: '2px',
                                             width: showTimeBlock ? '100%' : 'auto',
                                             boxSizing: 'border-box',
-                                            padding: '3px 6px', // 取消了条件判断，永远是 3px 6px
+                                            padding: '3px 6px',
                                             borderRadius: '5px',
                                             background: isConflict
                                               ? 'rgba(224, 49, 49, 0.12)'
                                               : isRelSearchHit
                                               ? 'rgba(255, 208, 0, 0.22)'
-                                              : 'var(--background-secondary)', // 取消条件判断，永远有底色
+                                              : 'var(--background-secondary)',
                                             border: isConflict
                                               ? '1px solid rgba(224, 49, 49, 0.45)'
-                                              : '1px solid var(--background-modifier-border)', // 取消条件判断，永远有边框
+                                              : '1px solid var(--background-modifier-border)',
                                             color: isConflict
                                               ? '#e03131'
                                               : edge.isInferred
@@ -3936,7 +4294,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                                             cursor: isConflict || (!listShowTime && hasTimeRange) ? 'help' : 'pointer',
                                           }}
                                         >
-                                          {/* 关系名称：带微型图标提示，使用 inline-flex 保证图标与文字完美垂直居中 */}
                                           <span
                                             style={{
                                               display: 'inline-flex',
@@ -3946,16 +4303,15 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                                               lineHeight: 1.3,
                                             }}
                                           >
-                                            {/* 有时间范围的关系：放到文案最前面，使用 marginRight 与文字隔开 */}
                                             {hasTimeRange && (
-                                              <span 
-                                                title="此关系带有生效时间范围" 
+                                              <span
+                                                title="此关系带有生效时间范围"
                                                 style={{ display: 'inline-flex', alignItems: 'center', marginRight: '4px' }}
                                               >
                                                 <Clock size={11} style={{ opacity: 0.65 }} />
                                               </span>
                                             )}
-                                            
+
                                             {highlightRelInList
                                               ? renderHighlightedText(edge.label, listSearchQuery)
                                               : edge.label}
@@ -3973,7 +4329,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                                                 textAlign: 'center',
                                               }}
                                             >
-                                              {edge.timeStr}
+                                              {formattedEdgeTime}
                                             </span>
                                           )}
                                         </div>
@@ -3984,7 +4340,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                               </td>
                             );
                           })}
-                          {/* 每一行最右侧延伸占位格：让每一行的底边横线完美贯通到最右侧 */}
+                          {/* 每一行最右侧延伸占位格 */}
                           <td
                             style={{
                               background:
@@ -3999,7 +4355,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                       );
                     })}
 
-                    {/* 底部弹性占位尾行：当人物行数不满一屏时自动撑满剩余高度，让第一列的右侧竖线一直延伸到最底部 */}
+                    {/* 底部弹性占位尾行 */}
                     <tr style={{ height: '100%' }}>
                       <td
                         style={{
@@ -4014,7 +4370,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                           padding: 0,
                         }}
                       >
-                        {/* 底部留白区的第一列右边界同样支持拖拽调宽 */}
                         <div
                           onMouseDown={handleFirstColResizeStart}
                           onClick={(e) => e.stopPropagation()}
@@ -4058,7 +4413,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
 
         {/* 右上角设置面板 */}
         {isPanelOpen && (
-          <div style={{ position: 'absolute', top: 16, right: 16, width: '320px', maxHeight: 'calc(100% - 32px)', display: 'flex', flexDirection: 'column', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', borderRadius: '8px', boxShadow: '0 8px 24px rgba(0,0,0,0.18)', fontSize: '13px', zIndex: 35, overflow: 'hidden' }}>
+          <div style={{ position: 'absolute', top: 16, right: 16, width: '332px', maxHeight: 'calc(100% - 32px)', display: 'flex', flexDirection: 'column', background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)', borderRadius: '8px', boxShadow: '0 8px 24px rgba(0,0,0,0.18)', fontSize: '13px', zIndex: 35, overflow: 'hidden' }}>
             <div style={{ flexShrink: 0, display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 16px', background: 'var(--background-secondary)', borderBottom: '1px solid var(--background-modifier-border)' }}>
               <strong style={{ fontSize: '14px', color: 'var(--text-normal)' }}>
                 {viewMode === 'graph' ? '图谱设置' : '列表设置'}
@@ -4115,7 +4470,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                     >
                       <label
                         style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', fontSize: '12px' }}
-                        title="仅展示直接反向关系与核心直系血亲/同门闭环（如兄弟共享父母、夫妻共享儿女）"
                       >
                         <input
                           type="radio"
@@ -4123,11 +4477,11 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                           checked={inferDisplayMode === 'partial'}
                           onChange={() => setInferDisplayMode('partial')}
                         />
-                        展示部分推算关系
+                        <span>展示部分推算关系</span>
+                        <HelpIcon text="仅展示直接反向关系与核心直系血亲/同门闭环（如兄弟共享父母、夫妻共享儿女）" />
                       </label>
                       <label
                         style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', fontSize: '12px' }}
-                        title="展示包含跨代（祖孙/师祖）、旁系（叔伯/姑舅）与姻亲（嫂子/岳父母/大舅哥）在内的全部全局推算关系"
                       >
                         <input
                           type="radio"
@@ -4135,7 +4489,8 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                           checked={inferDisplayMode === 'all'}
                           onChange={() => setInferDisplayMode('all')}
                         />
-                        展示全部推算关系
+                        <span>展示全部推算关系</span>
+                        <HelpIcon text="展示包含跨代（祖孙/师祖）、旁系（叔伯/姑舅）与姻亲（嫂子/岳父母/大舅哥）在内的全部全局推算关系" />
                       </label>
                     </div>
                   )}
@@ -4210,6 +4565,481 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                     连线长度: {linkDistance}
                     <input type="range" min="30" max="350" step="10" value={linkDistance} onChange={(e) => setLinkDistance(parseInt(e.target.value, 10))} style={{ width: '100%' }} />
                   </label>
+                </Accordion>
+
+                {/* 新增：自定义时间映射（位于“力度”与“时间轴范围与跳转”之间，默认折叠） */}
+                <Accordion
+                  defaultOpen={false}
+                  title="自定义时间映射"
+                  helpText="配置自定义纪年（如民国、年号或架空历法）。勾选启用，上下拖拽可调整在图谱与列表中的显示优先级顺序。"
+                >
+                  {/* 1. 映射设置列表 */}
+                  <div style={{ marginBottom: '12px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+                      <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-normal)' }}>
+                        映射设置
+                        <HelpIcon text="• 固定项「标准时间」默认启用，仅支持拖拽排序，不可修改或删除。\n• 自定义纪年必须填写名称与完整的起始年月日，否则无法保存生效（结束时间可选）。" />
+                      </span>
+                    </div>
+
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      {customEraItems.map((eraItem) => {
+                        const isValid = isCustomEraValid(eraItem);
+                        const isDragTarget = dragOverEraId === eraItem.id && draggedEraId !== eraItem.id;
+
+                        return (
+                          <div
+                            key={eraItem.id}
+                            draggable
+                            onDragStart={(e) => {
+                              setDraggedEraId(eraItem.id);
+                              e.dataTransfer.effectAllowed = 'move';
+                              e.dataTransfer.setData('text/plain', eraItem.id);
+                            }}
+                            onDragOver={(e) => {
+                              e.preventDefault();
+                              e.dataTransfer.dropEffect = 'move';
+                              if (dragOverEraId !== eraItem.id) {
+                                setDragOverEraId(eraItem.id);
+                              }
+                            }}
+                            onDragLeave={() => {
+                              if (dragOverEraId === eraItem.id) {
+                                setDragOverEraId(null);
+                              }
+                            }}
+                            onDrop={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              handleEraDrop(eraItem.id);
+                            }}
+                            onDragEnd={() => {
+                              setDraggedEraId(null);
+                              setDragOverEraId(null);
+                            }}
+                            style={{
+                              padding: '8px',
+                              background: 'var(--background-secondary)',
+                              borderRadius: '6px',
+                              border: !isValid
+                                ? '1px solid #e03131'
+                                : isDragTarget
+                                ? '1.5px dashed var(--interactive-accent)'
+                                : '1px solid var(--background-modifier-border)',
+                              opacity: draggedEraId === eraItem.id ? 0.45 : 1,
+                            }}
+                          >
+                            {/* 顶部行：拖拽手柄 + 勾选框 + 名称 + 状态提示/删除 */}
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              <span
+                                style={{ display: 'inline-flex', alignItems: 'center', cursor: 'grab', color: 'var(--text-faint)' }}
+                                title="上下拖拽调整显示顺序"
+                              >
+                                <GripVertical size={14} />
+                              </span>
+
+                              <input
+                                type="checkbox"
+                                checked={eraItem.isStandard ? true : eraItem.enabled}
+                                disabled={Boolean(eraItem.isStandard)}
+                                onChange={(e) => {
+                                  if (eraItem.isStandard) return;
+                                  updateCustomEraItem(eraItem.id, { enabled: e.target.checked });
+                                }}
+                                style={{ cursor: eraItem.isStandard ? 'not-allowed' : 'pointer' }}
+                                title={eraItem.isStandard ? '固定项常驻启用，不可取消勾选' : '勾选启用此自定义时间'}
+                              />
+
+                              {eraItem.isStandard ? (
+                                <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-normal)', flex: 1 }}>
+                                  标准时间
+                                </span>
+                              ) : (
+                                <>
+                                  <input
+                                    type="text"
+                                    placeholder="纪年名称 (如: 民国)"
+                                    value={eraItem.name}
+                                    onMouseDown={(e) => e.stopPropagation()}
+                                    onChange={(e) => updateCustomEraItem(eraItem.id, { name: e.target.value })}
+                                    style={{
+                                      flex: 1,
+                                      minWidth: 0,
+                                      padding: '3px 6px',
+                                      fontSize: '12px',
+                                      background: 'var(--background-primary)',
+                                      color: 'var(--text-normal)',
+                                      border: !eraItem.name.trim()
+                                        ? '1px solid rgba(224, 49, 49, 0.7)'
+                                        : '1px solid var(--background-modifier-border)',
+                                      borderRadius: '4px',
+                                    }}
+                                  />
+                                  {!isValid && (
+                                    <span
+                                      title="⚠️ 缺少纪年名称或完整的起始年月日，当前项不会被保存或生效"
+                                      style={{ display: 'inline-flex', alignItems: 'center', color: '#e03131', cursor: 'help' }}
+                                    >
+                                      <AlertTriangle size={14} />
+                                    </span>
+                                  )}
+                                  <span
+                                    role="button"
+                                    onMouseDown={(e) => e.stopPropagation()}
+                                    onMouseEnter={() => setHoveredDeleteEraId(eraItem.id)}
+                                    onMouseLeave={() => {
+                                      if (hoveredDeleteEraId === eraItem.id) setHoveredDeleteEraId(null);
+                                    }}
+                                    onClick={() => setCustomEraItems((prev) => prev.filter((it) => it.id !== eraItem.id))}
+                                    style={{
+                                      display: 'inline-flex',
+                                      alignItems: 'center',
+                                      justifyContent: 'center',
+                                      width: '24px',
+                                      height: '24px',
+                                      flexShrink: 0,
+                                      borderRadius: '4px',
+                                      background:
+                                        hoveredDeleteEraId === eraItem.id
+                                          ? 'rgba(201, 42, 42, 0.15)'
+                                          : 'transparent',
+                                      color:
+                                        hoveredDeleteEraId === eraItem.id
+                                          ? '#c92a2a' // 悬停时变成深红色显眼状态
+                                          : 'rgba(224, 49, 49, 0.48)', // 默认很弱的红色
+                                      cursor: 'pointer',
+                                      transition: 'all 0.15s ease',
+                                    }}
+                                    title="删除此项"
+                                  >
+                                    <svg
+                                      viewBox="0 0 24 24"
+                                      fill="none"
+                                      stroke="currentColor"
+                                      strokeWidth="2"
+                                      strokeLinecap="round"
+                                      strokeLinejoin="round"
+                                      style={{
+                                        width: '15px',
+                                        height: '15px',
+                                        minWidth: '15px',
+                                        minHeight: '15px',
+                                        display: 'block',
+                                        overflow: 'visible',
+                                        pointerEvents: 'none',
+                                      }}
+                                    >
+                                      <path d="M3 6h18" />
+                                      <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" />
+                                      <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
+                                      <line x1="10" y1="11" x2="10" y2="17" />
+                                      <line x1="14" y1="11" x2="14" y2="17" />
+                                    </svg>
+                                  </span>
+                                </>
+                              )}
+                            </div>
+
+                            {/* 自定义项的时间范围配置区 */}
+                            {!eraItem.isStandard && (
+                              <div
+                                onMouseDown={(e) => e.stopPropagation()}
+                                style={{ marginTop: '8px', paddingLeft: '20px', display: 'flex', flexDirection: 'column', gap: '6px' }}
+                              >
+                                {/* 起始时间（必填） */}
+                                <div>
+                                  <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginBottom: '3px' }}>
+                                    起始时间 (必填)
+                                  </div>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: '3px', flexWrap: 'wrap' }}>
+                                    <input
+                                      type="number"
+                                      min="1"
+                                      placeholder="年"
+                                      value={eraItem.startYear}
+                                      onChange={(e) => {
+                                        const v = e.target.value.trim();
+                                        updateCustomEraItem(eraItem.id, {
+                                          startYear: v === '' ? '' : Math.max(1, parseInt(v, 10) || 1),
+                                        });
+                                      }}
+                                      style={{
+                                        width: '54px',
+                                        padding: '2px 4px',
+                                        fontSize: '11px',
+                                        background: 'var(--background-primary)',
+                                        color: 'var(--text-normal)',
+                                        border: eraItem.startYear === '' ? '1px solid #e03131' : '1px solid var(--background-modifier-border)',
+                                        borderRadius: '4px',
+                                      }}
+                                    />
+                                    <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>年</span>
+                                    <input
+                                      type="number"
+                                      min="1"
+                                      max="12"
+                                      placeholder="月"
+                                      value={eraItem.startMonth}
+                                      onChange={(e) => {
+                                        const v = e.target.value.trim();
+                                        updateCustomEraItem(eraItem.id, {
+                                          startMonth: v === '' ? '' : Math.min(12, Math.max(1, parseInt(v, 10) || 1)),
+                                        });
+                                      }}
+                                      style={{
+                                        width: '36px',
+                                        padding: '2px 4px',
+                                        fontSize: '11px',
+                                        background: 'var(--background-primary)',
+                                        color: 'var(--text-normal)',
+                                        border: eraItem.startMonth === '' ? '1px solid #e03131' : '1px solid var(--background-modifier-border)',
+                                        borderRadius: '4px',
+                                      }}
+                                    />
+                                    <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>月</span>
+                                    <input
+                                      type="number"
+                                      min="1"
+                                      max="31"
+                                      placeholder="日"
+                                      value={eraItem.startDay}
+                                      onChange={(e) => {
+                                        const v = e.target.value.trim();
+                                        updateCustomEraItem(eraItem.id, {
+                                          startDay: v === '' ? '' : Math.min(31, Math.max(1, parseInt(v, 10) || 1)),
+                                        });
+                                      }}
+                                      style={{
+                                        width: '36px',
+                                        padding: '2px 4px',
+                                        fontSize: '11px',
+                                        background: 'var(--background-primary)',
+                                        color: 'var(--text-normal)',
+                                        border: eraItem.startDay === '' ? '1px solid #e03131' : '1px solid var(--background-modifier-border)',
+                                        borderRadius: '4px',
+                                      }}
+                                    />
+                                    <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>日</span>
+                                    <label style={{ display: 'flex', alignItems: 'center', gap: '2px', fontSize: '11px', color: 'var(--text-normal)', marginLeft: '2px', cursor: 'pointer' }}>
+                                      <input
+                                        type="checkbox"
+                                        checked={eraItem.startIsBC}
+                                        onChange={(e) => updateCustomEraItem(eraItem.id, { startIsBC: e.target.checked })}
+                                      />
+                                      BC
+                                    </label>
+                                  </div>
+                                </div>
+
+                                {/* 结束时间（可选） */}
+                                <div>
+                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', fontSize: '11px', color: 'var(--text-muted)', cursor: 'pointer', marginBottom: eraItem.hasEnd ? '3px' : 0 }}>
+                                    <input
+                                      type="checkbox"
+                                      checked={eraItem.hasEnd}
+                                      onChange={(e) => {
+                                        const checked = e.target.checked;
+                                        updateCustomEraItem(eraItem.id, {
+                                          hasEnd: checked,
+                                          endYear: checked && eraItem.endYear === '' ? (eraItem.startYear || 2000) : eraItem.endYear,
+                                          endMonth: checked && eraItem.endMonth === '' ? 12 : eraItem.endMonth,
+                                          endDay: checked && eraItem.endDay === '' ? 31 : eraItem.endDay,
+                                        });
+                                      }}
+                                    />
+                                    <span>设置结束时间 (可选)</span>
+                                  </label>
+
+                                  {eraItem.hasEnd && (
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '3px', flexWrap: 'wrap' }}>
+                                      <input
+                                        type="number"
+                                        min="1"
+                                        placeholder="年"
+                                        value={eraItem.endYear}
+                                        onChange={(e) => {
+                                          const v = e.target.value.trim();
+                                          updateCustomEraItem(eraItem.id, {
+                                            endYear: v === '' ? '' : Math.max(1, parseInt(v, 10) || 1),
+                                          });
+                                        }}
+                                        style={{
+                                          width: '54px',
+                                          padding: '2px 4px',
+                                          fontSize: '11px',
+                                          background: 'var(--background-primary)',
+                                          color: 'var(--text-normal)',
+                                          border: '1px solid var(--background-modifier-border)',
+                                          borderRadius: '4px',
+                                        }}
+                                      />
+                                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>年</span>
+                                      <input
+                                        type="number"
+                                        min="1"
+                                        max="12"
+                                        placeholder="月"
+                                        value={eraItem.endMonth}
+                                        onChange={(e) => {
+                                          const v = e.target.value.trim();
+                                          updateCustomEraItem(eraItem.id, {
+                                            endMonth: v === '' ? '' : Math.min(12, Math.max(1, parseInt(v, 10) || 1)),
+                                          });
+                                        }}
+                                        style={{
+                                          width: '36px',
+                                          padding: '2px 4px',
+                                          fontSize: '11px',
+                                          background: 'var(--background-primary)',
+                                          color: 'var(--text-normal)',
+                                          border: '1px solid var(--background-modifier-border)',
+                                          borderRadius: '4px',
+                                        }}
+                                      />
+                                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>月</span>
+                                      <input
+                                        type="number"
+                                        min="1"
+                                        max="31"
+                                        placeholder="日"
+                                        value={eraItem.endDay}
+                                        onChange={(e) => {
+                                          const v = e.target.value.trim();
+                                          updateCustomEraItem(eraItem.id, {
+                                            endDay: v === '' ? '' : Math.min(31, Math.max(1, parseInt(v, 10) || 1)),
+                                          });
+                                        }}
+                                        style={{
+                                          width: '36px',
+                                          padding: '2px 4px',
+                                          fontSize: '11px',
+                                          background: 'var(--background-primary)',
+                                          color: 'var(--text-normal)',
+                                          border: '1px solid var(--background-modifier-border)',
+                                          borderRadius: '4px',
+                                        }}
+                                      />
+                                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>日</span>
+                                      <label style={{ display: 'flex', alignItems: 'center', gap: '2px', fontSize: '11px', color: 'var(--text-normal)', marginLeft: '2px', cursor: 'pointer' }}>
+                                        <input
+                                          type="checkbox"
+                                          checked={eraItem.endIsBC}
+                                          onChange={(e) => updateCustomEraItem(eraItem.id, { endIsBC: e.target.checked })}
+                                        />
+                                        BC
+                                      </label>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    <button
+                      onClick={() => {
+                        const newId = `era_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+                        setCustomEraItems((prev) => [
+                          ...prev,
+                          {
+                            id: newId,
+                            enabled: true,
+                            name: '',
+                            startYear: 1912,
+                            startMonth: 1,
+                            startDay: 1,
+                            startIsBC: false,
+                            hasEnd: false,
+                            endYear: '',
+                            endMonth: '',
+                            endDay: '',
+                            endIsBC: false,
+                          },
+                        ]);
+                      }}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        width: '100%',
+                        padding: '5px',
+                        background: 'var(--background-secondary)',
+                        border: '1px dashed var(--background-modifier-border)',
+                        borderRadius: '4px',
+                        cursor: 'pointer',
+                        marginTop: '8px',
+                        color: 'var(--text-normal)',
+                        fontSize: '12px',
+                      }}
+                    >
+                      <Plus size={14} style={{ marginRight: '4px' }} /> 添加自定义时间
+                    </button>
+                  </div>
+
+                  {/* 2. 自定义时间的映射范围 */}
+                  <div style={{ marginBottom: '12px', paddingTop: '10px', borderTop: '1px solid var(--background-modifier-border)' }}>
+                    <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-normal)', marginBottom: '6px' }}>
+                      自定义时间的映射范围
+                      <HelpIcon text="• 映射至整个时间轴：从设定的起始时间开始向未来无限延续显示（起始时间之前不显示）。\n• 仅映射有效范围：仅在设定的[起始时间 ~ 结束时间]区间内显示。" />
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: 'var(--text-normal)', cursor: 'pointer' }}>
+                        <input
+                          type="radio"
+                          name="customEraMappingScope"
+                          checked={customEraMappingScope === 'entire'}
+                          onChange={() => setCustomEraMappingScope('entire')}
+                        />
+                        <span>将选择的自定义时间映射至整个时间轴</span>
+                      </label>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: 'var(--text-normal)', cursor: 'pointer' }}>
+                        <input
+                          type="radio"
+                          name="customEraMappingScope"
+                          checked={customEraMappingScope === 'valid_only'}
+                          onChange={() => setCustomEraMappingScope('valid_only')}
+                        />
+                        <span>自定义时间仅映射有效范围</span>
+                      </label>
+                    </div>
+                  </div>
+
+                  {/* 3. 图谱年份显示设置 */}
+                  <div style={{ paddingTop: '10px', borderTop: '1px solid var(--background-modifier-border)' }}>
+                    <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-normal)', marginBottom: '6px' }}>
+                      年份显示设置
+                      <HelpIcon text="控制底部时间轴中央紫色胶囊的年份显示方式。选择「自定义年份」时，将按上方排序展示双层胶囊。" />
+                    </div>
+                    <div style={{ position: 'relative', display: 'flex', alignItems: 'center', width: '100%' }}>
+                      <select
+                        value={graphYearDisplayMode}
+                        onChange={(e) => setGraphYearDisplayMode(e.target.value as GraphYearDisplayMode)}
+                        style={{
+                          width: '100%',
+                          padding: '5px 28px 5px 8px',
+                          fontSize: '12px',
+                          background: 'var(--background-secondary)',
+                          color: 'var(--text-normal)',
+                          border: '1px solid var(--background-modifier-border)',
+                          borderRadius: '6px',
+                          cursor: 'pointer',
+                          outline: 'none',
+                          appearance: 'none',
+                          WebkitAppearance: 'none',
+                        }}
+                      >
+                        <option value="standard">标准年份</option>
+                        <option value="custom">自定义年份</option>
+                      </select>
+                      <ChevronDown
+                        size={14}
+                        color="var(--text-muted)"
+                        style={{ position: 'absolute', right: '8px', pointerEvents: 'none' }}
+                      />
+                    </div>
+                  </div>
                 </Accordion>
 
                 <Accordion defaultOpen={true} title="时间轴范围与跳转">
@@ -4336,175 +5166,222 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                 </Accordion>
               </div>
             ) : (
-              /* 列表视图专属设置面板（移除折叠包裹，直接平铺展示） */
-              <div style={{ flex: 1, overflowY: 'auto', padding: '14px 16px' }}>
-                {/* 带范围选择器（全部 / 人物 / 关系）的组合搜索框 */}
-                <div
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    background: 'var(--background-secondary)',
-                    borderRadius: '6px',
-                    padding: '3px 6px',
-                    marginBottom: '12px',
-                    border: '1px solid var(--background-modifier-border)',
-                    gap: '4px',
-                  }}
-                >
-                  <Search color="var(--text-muted)" size={14} style={{ flexShrink: 0, marginLeft: '2px' }} />
-                  <select
-                    value={listSearchScope}
-                    onChange={(e) => setListSearchScope(e.target.value as 'all' | 'character' | 'relation')}
+              /* 列表视图专属设置面板：按语义分组留白，隐藏大段说明文字进问号气泡 */
+              <div style={{ flex: 1, overflowY: 'auto', padding: '16px' }}>
+                {/* 第一组：查找与人物排序（同类紧凑间距） */}
+                <div style={{ paddingBottom: '16px', marginBottom: '16px', borderBottom: '1px solid var(--background-modifier-border)' }}>
+                  <div
                     style={{
-                      border: 'none',
-                      background: 'var(--background-primary)',
-                      color: 'var(--text-normal)',
-                      fontSize: '11px',
-                      padding: '2px 4px',
-                      borderRadius: '4px',
-                      cursor: 'pointer',
-                      outline: 'none',
+                      display: 'flex',
+                      alignItems: 'center',
+                      background: 'var(--background-secondary)',
+                      borderRadius: '6px',
+                      padding: '3px 6px',
+                      marginBottom: '10px',
+                      border: '1px solid var(--background-modifier-border)',
+                      gap: '4px',
                     }}
-                    title="选择搜索范围"
                   >
-                    <option value="all">全部</option>
-                    <option value="character">人物</option>
-                    <option value="relation">关系</option>
-                  </select>
-                  <input
-                    type="text"
-                    placeholder={
-                      listSearchScope === 'character'
-                        ? '筛选左侧人物...'
-                        : listSearchScope === 'relation'
-                        ? '搜索关系称谓...'
-                        : '搜索人物或关系...'
-                    }
-                    value={listSearchQuery}
-                    onChange={(e) => setListSearchQuery(e.target.value)}
-                    style={{
-                      border: 'none',
-                      background: 'transparent',
-                      outline: 'none',
-                      flex: 1,
-                      minWidth: 0,
-                      color: 'var(--text-normal)',
-                      fontSize: '12px',
-                    }}
-                  />
-                  {listSearchQuery && (
-                    <button
-                      onClick={() => setListSearchQuery('')}
+                    <Search color="var(--text-muted)" size={14} style={{ flexShrink: 0, marginLeft: '2px' }} />
+                    <select
+                      value={listSearchScope}
+                      onChange={(e) => setListSearchScope(e.target.value as 'all' | 'character' | 'relation')}
                       style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        padding: '2px',
-                        background: 'transparent',
                         border: 'none',
+                        background: 'var(--background-primary)',
+                        color: 'var(--text-normal)',
+                        fontSize: '11px',
+                        padding: '2px 4px',
+                        borderRadius: '4px',
                         cursor: 'pointer',
-                        color: 'var(--text-muted)',
+                        outline: 'none',
                       }}
-                      title="清空搜索内容"
+                      title="选择搜索范围"
                     >
-                      <X size={14} />
-                    </button>
+                      <option value="all">全部</option>
+                      <option value="character">人物</option>
+                      <option value="relation">关系</option>
+                    </select>
+                    <input
+                      type="text"
+                      placeholder={
+                        listSearchScope === 'character'
+                          ? '筛选左侧人物...'
+                          : listSearchScope === 'relation'
+                          ? '搜索关系称谓...'
+                          : '搜索人物或关系...'
+                      }
+                      value={listSearchQuery}
+                      onChange={(e) => setListSearchQuery(e.target.value)}
+                      style={{
+                        border: 'none',
+                        background: 'transparent',
+                        outline: 'none',
+                        flex: 1,
+                        minWidth: 0,
+                        color: 'var(--text-normal)',
+                        fontSize: '12px',
+                      }}
+                    />
+                    {listSearchQuery && (
+                      <button
+                        onClick={() => setListSearchQuery('')}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          padding: '2px',
+                          background: 'transparent',
+                          border: 'none',
+                          cursor: 'pointer',
+                          color: 'var(--text-muted)',
+                        }}
+                        title="清空搜索内容"
+                      >
+                        <X size={14} />
+                      </button>
+                    )}
+                  </div>
+
+                  <div>
+                    <div style={{ fontSize: '12px', color: 'var(--text-normal)', marginBottom: '6px', fontWeight: 500, display: 'flex', alignItems: 'center' }}>
+                      <span>人物排序方式</span>
+                      <HelpIcon text="直接上下拖拽表格最左侧人物行即可调整自定义顺序，顶部人物行将自动同步。" />
+                    </div>
+                    <div style={{ position: 'relative', display: 'flex', alignItems: 'center', width: '100%' }}>
+                      <select
+                        value={listSortMode}
+                        onChange={(e) => triggerSortWithLoading(e.target.value as ListSortMode)}
+                        style={{
+                          width: '100%',
+                          padding: '5px 28px 5px 8px',
+                          fontSize: '12px',
+                          background: 'var(--background-secondary)',
+                          color: 'var(--text-normal)',
+                          border: '1px solid var(--background-modifier-border)',
+                          borderRadius: '6px',
+                          cursor: 'pointer',
+                          outline: 'none',
+                          appearance: 'none',
+                          WebkitAppearance: 'none',
+                        }}
+                      >
+                        <option value="explorer">与文件管理器一致 (含 Flexplorer)</option>
+                        <option value="manual">手动拖拽排序 (自定义记忆)</option>
+                        <option value="name-asc">名称 (A - Z)</option>
+                        <option value="name-desc">名称 (Z - A)</option>
+                        <option value="mtime-desc">修改时间 (最新在前)</option>
+                        <option value="mtime-asc">修改时间 (最早在前)</option>
+                        <option value="ctime-desc">创建时间 (最新在前)</option>
+                        <option value="ctime-asc">创建时间 (最早在前)</option>
+                      </select>
+                      <ChevronDown
+                        size={14}
+                        color="var(--text-muted)"
+                        style={{ position: 'absolute', right: '8px', pointerEvents: 'none' }}
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {/* 第二组：推算关系设置 */}
+                <div style={{ paddingBottom: '16px', marginBottom: '16px', borderBottom: '1px solid var(--background-modifier-border)' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', fontWeight: 500, fontSize: '12px' }}>
+                    <input type="checkbox" checked={enableInferred} onChange={(e) => setEnableInferred(e.target.checked)} />
+                    <span>开启推算关系</span>
+                  </label>
+
+                  {enableInferred && (
+                    <div
+                      style={{
+                        marginTop: '8px',
+                        marginLeft: '18px',
+                        padding: '8px 10px',
+                        background: 'var(--background-secondary)',
+                        borderRadius: '6px',
+                        borderLeft: '2px solid var(--interactive-accent)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '6px',
+                      }}
+                    >
+                      <label
+                        style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', fontSize: '12px' }}
+                      >
+                        <input
+                          type="radio"
+                          name="listInferDisplayMode"
+                          checked={inferDisplayMode === 'partial'}
+                          onChange={() => setInferDisplayMode('partial')}
+                        />
+                        <span>展示部分推算关系</span>
+                        <HelpIcon text="仅展示直接反向关系与核心直系血亲/同门闭环（如兄弟共享父母、夫妻共享儿女）" />
+                      </label>
+                      <label
+                        style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', fontSize: '12px' }}
+                      >
+                        <input
+                          type="radio"
+                          name="listInferDisplayMode"
+                          checked={inferDisplayMode === 'all'}
+                          onChange={() => setInferDisplayMode('all')}
+                        />
+                        <span>展示全部推算关系</span>
+                        <HelpIcon text="展示包含跨代（祖孙/师祖）、旁系（叔伯/姑舅）与姻亲（嫂子/岳父母/大舅哥）在内的全部全局推算关系" />
+                      </label>
+                    </div>
                   )}
                 </div>
 
-                {/* 人物排序选择器 */}
-                <div style={{ marginBottom: '12px' }}>
-                  <div style={{ fontSize: '12px', color: 'var(--text-normal)', marginBottom: '6px', fontWeight: 500 }}>
-                    人物排序方式
+                {/* 第三组：年份与时间显示设置 */}
+                <div style={{ paddingBottom: '16px', marginBottom: '16px', borderBottom: '1px solid var(--background-modifier-border)' }}>
+                  <div style={{ marginBottom: '10px' }}>
+                    <div style={{ fontSize: '12px', color: 'var(--text-normal)', marginBottom: '6px', fontWeight: 500, display: 'flex', alignItems: 'center' }}>
+                      <span>年份显示设置</span>
+                      <HelpIcon text="控制列表单元格与悬浮提示中的起止日期格式。自定义年份的开启项与先后顺序请在「图谱设置 -> 自定义时间映射」中配置。" />
+                    </div>
+                    <div style={{ position: 'relative', display: 'flex', alignItems: 'center', width: '100%' }}>
+                      <select
+                        value={listYearDisplayMode}
+                        onChange={(e) => setListYearDisplayMode(e.target.value as ListYearDisplayMode)}
+                        style={{
+                          width: '100%',
+                          padding: '5px 28px 5px 8px',
+                          fontSize: '12px',
+                          background: 'var(--background-secondary)',
+                          color: 'var(--text-normal)',
+                          border: '1px solid var(--background-modifier-border)',
+                          borderRadius: '6px',
+                          cursor: 'pointer',
+                          outline: 'none',
+                          appearance: 'none',
+                          WebkitAppearance: 'none',
+                        }}
+                      >
+                        <option value="standard">标准年份</option>
+                        <option value="custom_first">自定义年份（1个）</option>
+                        <option value="custom_first_with_standard">自定义年份（1个）+ 标准年份</option>
+                        <option value="custom_all">自定义年份（全部）</option>
+                      </select>
+                      <ChevronDown
+                        size={14}
+                        color="var(--text-muted)"
+                        style={{ position: 'absolute', right: '8px', pointerEvents: 'none' }}
+                      />
+                    </div>
                   </div>
-                  <select
-                    value={listSortMode}
-                    onChange={(e) => triggerSortWithLoading(e.target.value as ListSortMode)}
-                    style={{
-                      width: '100%',
-                      padding: '5px 8px',
-                      fontSize: '12px',
-                      background: 'var(--background-secondary)',
-                      color: 'var(--text-normal)',
-                      border: '1px solid var(--background-modifier-border)',
-                      borderRadius: '6px',
-                      cursor: 'pointer',
-                      outline: 'none',
-                    }}
+
+                  <label
+                    style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', fontSize: '12px', fontWeight: 500 }}
                   >
-                    <option value="explorer">与文件管理器一致 (含 Flexplorer)</option>
-                    <option value="manual">手动拖拽排序 (自定义记忆)</option>
-                    <option value="name-asc">名称 (A - Z)</option>
-                    <option value="name-desc">名称 (Z - A)</option>
-                    <option value="mtime-desc">修改时间 (最新在前)</option>
-                    <option value="mtime-asc">修改时间 (最早在前)</option>
-                    <option value="ctime-desc">创建时间 (最新在前)</option>
-                    <option value="ctime-asc">创建时间 (最早在前)</option>
-                  </select>
-                  <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px', lineHeight: 1.4 }}>
-                    💡 直接上下拖拽表格最左侧人物行即可调整自定义顺序，顶部人物行将自动同步。
-                  </div>
+                    <input type="checkbox" checked={listShowTime} onChange={(e) => setListShowTime(e.target.checked)} />
+                    <span>开启时间显示</span>
+                    <HelpIcon text="开启后在有时间范围的关系下方直接显示起止时间；关闭时鼠标悬停在带有时钟图标的关系上可查看时间提示。" />
+                  </label>
                 </div>
 
-                {/* 开启推算关系 */}
-                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', marginBottom: '8px' }}>
-                  <input type="checkbox" checked={enableInferred} onChange={(e) => setEnableInferred(e.target.checked)} />
-                  开启推算关系
-                </label>
-
-                {enableInferred && (
-                  <div
-                    style={{
-                      marginTop: '6px',
-                      marginBottom: '10px',
-                      marginLeft: '18px',
-                      padding: '8px 10px',
-                      background: 'var(--background-secondary)',
-                      borderRadius: '6px',
-                      borderLeft: '2px solid var(--interactive-accent)',
-                      display: 'flex',
-                      flexDirection: 'column',
-                      gap: '6px',
-                    }}
-                  >
-                    <label
-                      style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', fontSize: '12px' }}
-                      title="仅展示直接反向关系与核心直系血亲/同门闭环（如兄弟共享父母、夫妻共享儿女）"
-                    >
-                      <input
-                        type="radio"
-                        name="listInferDisplayMode"
-                        checked={inferDisplayMode === 'partial'}
-                        onChange={() => setInferDisplayMode('partial')}
-                      />
-                      展示部分推算关系
-                    </label>
-                    <label
-                      style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', fontSize: '12px' }}
-                      title="展示包含跨代（祖孙/师祖）、旁系（叔伯/姑舅）与姻亲（嫂子/岳父母/大舅哥）在内的全部全局推算关系"
-                    >
-                      <input
-                        type="radio"
-                        name="listInferDisplayMode"
-                        checked={inferDisplayMode === 'all'}
-                        onChange={() => setInferDisplayMode('all')}
-                      />
-                      展示全部推算关系
-                    </label>
-                  </div>
-                )}
-
-                {/* 开启时间显示 */}
-                <label
-                  style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: 'var(--text-normal)', marginTop: '6px', marginBottom: '14px' }}
-                  title="开启后在有时间范围的关系下方直接弱化显示时间；关闭时鼠标悬停在关系上可查看时间提示"
-                >
-                  <input type="checkbox" checked={listShowTime} onChange={(e) => setListShowTime(e.target.checked)} />
-                  开启时间显示
-                </label>
-
-                {/* 关系列默认宽度滑块（仅在未开启时间显示时生效，开启时间显示后自适应锁定为 168px） */}
-                <div style={{ paddingTop: '12px', borderTop: '1px solid var(--background-modifier-border)' }}>
+                {/* 第四组：列宽控制 */}
+                <div>
                   <label
                     style={{
                       display: 'block',
@@ -4514,7 +5391,10 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                     }}
                   >
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
-                      <span>关系列默认宽度</span>
+                      <span style={{ display: 'inline-flex', alignItems: 'center' }}>
+                        关系列默认宽度
+                        <HelpIcon text="开启「时间显示」后，列宽自动加宽锁定为 168px 以完整容纳时间范围；关闭「时间显示」后可通过滑块自由调节。" />
+                      </span>
                       <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
                         {listShowTime ? '已自动适配 (168px)' : `${listColWidth}px`}
                       </span>
@@ -4534,11 +5414,6 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                       }}
                     />
                   </label>
-                  {listShowTime && (
-                    <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px', lineHeight: 1.35 }}>
-                      💡 开启时间显示后，列宽已自动加宽以完整容纳时间范围；关闭「开启时间显示」后可自由调节。
-                    </div>
-                  )}
                 </div>
               </div>
             )}
@@ -4552,7 +5427,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
           ref={timelineWrapRef}
           onWheel={handleTimelineWheel}
           style={{
-            height: '82px',
+            height: '86px',
             width: '100%',
             background: 'var(--background-secondary)',
             borderTop: '1px solid var(--background-modifier-border)',
@@ -4567,7 +5442,7 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
             onMouseDown={handleTimelineMouseDown}
             style={{
               position: 'relative',
-              height: '52px',
+              height: '56px',
               width: '100%',
               overflow: 'hidden',
               cursor: 'ew-resize',
@@ -4633,24 +5508,54 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                 pointerEvents: 'none',
               }}
             />
+
+            {/* 中央时间胶囊组：支持单层标准胶囊或双层自定义纪年胶囊 */}
             <div
               style={{
                 position: 'absolute',
                 left: '50%',
                 top: '2px',
                 transform: 'translateX(-50%)',
-                padding: '1px 8px',
-                background: 'var(--interactive-accent)',
-                color: 'var(--text-on-accent)',
-                fontSize: '11px',
-                fontWeight: 600,
-                borderRadius: '10px',
-                whiteSpace: 'nowrap',
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                gap: '2px',
                 pointerEvents: 'none',
-                boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
+                zIndex: 5,
               }}
             >
-              {formatCurrentTimeBadge(currentYear, viewSpan)}
+              <div
+                style={{
+                  padding: '1px 8px',
+                  background: 'var(--interactive-accent)',
+                  color: 'var(--text-on-accent)',
+                  fontSize: '11px',
+                  fontWeight: 600,
+                  borderRadius: '10px',
+                  whiteSpace: 'nowrap',
+                  boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
+                }}
+              >
+                {timelineCenterBadges.primaryText}
+              </div>
+
+              {timelineCenterBadges.secondaryText && (
+                <div
+                  style={{
+                    padding: '0px 7px',
+                    background: 'color-mix(in srgb, var(--interactive-accent) 82%, var(--background-primary))',
+                    color: 'var(--text-on-accent)',
+                    fontSize: '10px',
+                    fontWeight: 500,
+                    borderRadius: '8px',
+                    whiteSpace: 'nowrap',
+                    boxShadow: '0 1px 4px rgba(0,0,0,0.16)',
+                    lineHeight: 1.4,
+                  }}
+                >
+                  {timelineCenterBadges.secondaryText}
+                </div>
+              )}
             </div>
           </div>
 
