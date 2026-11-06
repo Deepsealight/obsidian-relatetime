@@ -14,6 +14,8 @@ With its original “hybrid deterministic engine + LLM-based global knowledge gr
 
 <img src="https://github.com/user-attachments/assets/cebb7756-39bc-4249-9c26-a6e88c189a85" style="width: 100%; height: auto;" alt="RelateTime Demo" />
 
+<img src="https://github.com/user-attachments/assets/ad1a4432-df16-4f7a-84b0-de6fc044a090" style="width: 100%; height: auto;" alt="RelateTime Demo" />
+
 
 ## ✨ Features
 
