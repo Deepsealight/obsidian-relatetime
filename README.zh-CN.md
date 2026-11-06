@@ -14,6 +14,8 @@
 
 <img src="https://github.com/user-attachments/assets/cebb7756-39bc-4249-9c26-a6e88c189a85" style="width: 100%; height: auto;" alt="RelateTime Demo" />
 
+<img src="https://github.com/user-attachments/assets/ad1a4432-df16-4f7a-84b0-de6fc044a090" style="width: 100%; height: auto;" alt="RelateTime Demo" />
+
 
 ## ✨ 核心特色 (Features)
 
@@ -87,3 +89,4 @@ character-name: 温迪
 - **滚动鼠标滚轮** 放大/缩小时间轴精度。
 - **点击节点** 锁定焦点，**右侧菜单** 提供强大的搜索（连带显示邻居）与外观定制功能。
 - **列表视图** 列表页里的关系，表示顶部人物是左侧人物的某某某。
+- **自定义时间映射** 可以配置自定义纪年（如民国、年号或架空历法）。
