@@ -4838,12 +4838,8 @@ function RelateTimeWorkspace({ plugin }: { plugin: any }) {
                                       type="checkbox"
                                       checked={eraItem.hasEnd}
                                       onChange={(e) => {
-                                        const checked = e.target.checked;
                                         updateCustomEraItem(eraItem.id, {
-                                          hasEnd: checked,
-                                          endYear: checked && eraItem.endYear === '' ? (eraItem.startYear || 2000) : eraItem.endYear,
-                                          endMonth: checked && eraItem.endMonth === '' ? 12 : eraItem.endMonth,
-                                          endDay: checked && eraItem.endDay === '' ? 31 : eraItem.endDay,
+                                          hasEnd: e.target.checked,
                                         });
                                       }}
                                     />
